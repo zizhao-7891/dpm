@@ -1420,6 +1420,7 @@ internal static class Program
             _completedBytes += downloadedBytes;
             _currentBytes = 0;
             _completedPackages++;
+            _currentPackageLine = "";
             Draw();
             if (_completedPackages == _packageCount && !Console.IsOutputRedirected)
                 Console.WriteLine();

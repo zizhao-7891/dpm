@@ -109,11 +109,12 @@ index path and SHA256 match the cached index metadata, the large package index
 is not downloaded again.
 
 Package downloads show the per-package transfer progress plus an overall
-`总共[已完成/总数]` progress line. The overall bar uses signed package sizes,
-with aggregate measured speed and estimated remaining time; if package sizes
-are unavailable, it falls back to completed-package progress rather than
-inventing a byte percentage. The per-package line shows received-byte
-percentage and estimated remaining seconds.
+`总共[已完成/总数]` progress line. After each package finishes, its progress
+line is cleared and reused for the next package. The overall bar uses signed
+package sizes, with aggregate measured speed and estimated remaining time; if
+package sizes are unavailable, it falls back to completed-package progress
+rather than inventing a byte percentage. The per-package line shows
+received-byte percentage and estimated remaining seconds.
 
 `dpm clear` shows the number and total size of cached `.deb` archives and asks
 for confirmation before deleting them. Package indexes are kept; `dpm clear
