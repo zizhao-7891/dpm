@@ -77,11 +77,13 @@ dpm search TERM
 
 `install`, `reinstall`, and `upgrade` resolve `Pre-Depends` and `Depends`,
 including version constraints, alternative dependencies, and virtual packages
-declared by `Provides`. Already-installed satisfying packages are reused;
-missing dependencies are selected from the signed package indexes, included in
-the confirmation list, downloaded, and passed to `dpkg` together with the
-requested packages. Packages are ordered so selected `Pre-Depends` are
-installed before their dependents. `Recommends` and `Suggests` are not
+declared by `Provides`. When a package is identified as a metapackage, its
+`Recommends` are also resolved recursively so its full package set is included.
+Already-installed satisfying packages are reused; missing dependencies are
+selected from the signed package indexes, included in the confirmation list,
+downloaded, and passed to `dpkg` together with the requested packages.
+Packages are ordered so selected `Pre-Depends` are installed before their
+dependents. `Recommends` for regular packages and all `Suggests` are not
 installed automatically.
 
 `reinstall` requires the package to be installed and its exact installed version

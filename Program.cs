@@ -692,8 +692,12 @@ internal static class Program
                 return;
             try
             {
-                foreach (var dependency in ParseDependencyGroups(package.PreDepends)
-                             .Concat(ParseDependencyGroups(package.Depends)))
+                var dependencyGroups = ParseDependencyGroups(package.PreDepends)
+                    .Concat(ParseDependencyGroups(package.Depends));
+                if (package.IsMetaPackage)
+                    dependencyGroups = dependencyGroups.Concat(ParseDependencyGroups(package.Recommends));
+
+                foreach (var dependency in dependencyGroups)
                 {
                     var satisfiedBySelected = dependency.Any(alternative =>
                         selected.Values.Any(candidate =>
@@ -1250,8 +1254,16 @@ internal static class Program
                 fields.TryGetValue("Pre-Depends", out var preDepends);
                 fields.TryGetValue("Depends", out var depends);
                 fields.TryGetValue("Provides", out var provides);
+                fields.TryGetValue("Recommends", out var recommends);
+                fields.TryGetValue("Section", out var section);
+                fields.TryGetValue("Tag", out var tags);
+                var isMetaPackage = string.Equals(section, "metapackages", StringComparison.OrdinalIgnoreCase) ||
+                                    (tags ?? "").Split([',', ' ', '\t', '\r', '\n'],
+                                        StringSplitOptions.RemoveEmptyEntries)
+                                    .Contains("role::metapackage", StringComparer.OrdinalIgnoreCase);
                 result.Add(new PackageRecord(name, version, filename, hash ?? "", description ?? "",
-                    sourceUri, preDepends ?? "", depends ?? "", provides ?? "", size));
+                    sourceUri, preDepends ?? "", depends ?? "", provides ?? "", recommends ?? "",
+                    isMetaPackage, size));
             }
         }
         return result;
@@ -1654,6 +1666,8 @@ internal static class Program
         string PreDepends,
         string Depends,
         string Provides,
+        string Recommends,
+        bool IsMetaPackage,
         long? Size);
     private sealed record DependencyAlternative(string Name, string? Relation, string? Version);
     private sealed record PackageChange(string Name, string? CurrentVersion, string? TargetVersion, string? Reason = null);
