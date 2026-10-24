@@ -68,6 +68,11 @@ internal static class Program
                     await UpdateAsync();
                     await InstallAsync(args[1]);
                     break;
+                case "reinstall":
+                    RequireCount(args, 2);
+                    await UpdateAsync();
+                    await ReinstallAsync(args[1]);
+                    break;
                 case "remove":
                 case "uninstall":
                     RequireCount(args, 2);
@@ -124,6 +129,7 @@ internal static class Program
               dpm update
               dpm up                    (alias for update)
               dpm install PACKAGE       (updates indexes before installing)
+              dpm reinstall PACKAGE    (reinstalls the installed package version)
               dpm remove PACKAGE
               dpm uninstall PACKAGE    (alias for remove)
               dpm purge PACKAGE        (remove package and its configuration files)
@@ -342,6 +348,34 @@ internal static class Program
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
+        AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
+        WriteDpmAutoInstalled(autoInstalled);
+    }
+
+    private static async Task ReinstallAsync(string packageName)
+    {
+        var installed = await GetInstalledAsync();
+        var current = installed.FirstOrDefault(entry => PackageNameMatches(entry.Key, packageName));
+        if (current.Key is null)
+            throw new InvalidOperationException($"Package '{packageName}' is not installed.");
+
+        var root = LoadPackages().FirstOrDefault(package =>
+            PackageNameMatches(package.Name, current.Key) &&
+            package.Version == current.Value.Version);
+        if (root is null)
+            throw new InvalidOperationException(
+                $"Package '{current.Key}' version {current.Value.Version} is not available in the configured repositories.");
+
+        var plan = ResolveDependencies([root], installed);
+        var changes = CreatePackageChanges(plan, installed);
+        if (!ConfirmPackageChanges("重新安装", changes))
+            return;
+
+        var files = new List<string>();
+        foreach (var package in plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
+            files.Add(await DownloadPackageAsync(package));
+        await RunDpkgAsync(["--install", .. files], files.Count, true);
+        var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
         WriteDpmAutoInstalled(autoInstalled);
     }

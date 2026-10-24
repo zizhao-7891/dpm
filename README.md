@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.20_arm64.deb
+sudo dpkg -i dist/dpm_0.1.21_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -56,6 +56,7 @@ in `/var/cache/dpm/deb`.
 dpm update
 dpm up                    # alias for update
 dpm install PACKAGE       # refreshes indexes before selecting/downloading the package
+dpm reinstall PACKAGE     # reinstalls the installed version from the repositories
 dpm remove PACKAGE
 dpm uninstall PACKAGE     # alias for remove
 dpm purge PACKAGE         # remove package and its configuration files
@@ -67,12 +68,16 @@ dpm clear                 # clear downloaded .deb cache (keeps indexes)
 dpm search TERM
 ```
 
-`install` and `upgrade` resolve `Pre-Depends` and `Depends`, including version
-constraints, alternative dependencies, and virtual packages declared by
-`Provides`. Already-installed satisfying packages are reused; missing
-dependencies are selected from the signed package indexes, included in the
-confirmation list, downloaded, and passed to `dpkg` together with the requested
-packages. `Recommends` and `Suggests` are not installed automatically.
+`install`, `reinstall`, and `upgrade` resolve `Pre-Depends` and `Depends`,
+including version constraints, alternative dependencies, and virtual packages
+declared by `Provides`. Already-installed satisfying packages are reused;
+missing dependencies are selected from the signed package indexes, included in
+the confirmation list, downloaded, and passed to `dpkg` together with the
+requested packages. `Recommends` and `Suggests` are not installed automatically.
+
+`reinstall` requires the package to be installed and its exact installed version
+to be available in the configured repositories. It reinstalls that version
+rather than silently upgrading it.
 
 When removing or purging a package, `dpm` also detects unreachable automatic
 packages and offers to remove them in the same transaction. Only dependencies
@@ -82,15 +87,16 @@ APT, are never classified or removed as dpm orphans. Dependencies still
 reachable from any other installed package are kept. Orphans are shown
 separately in the confirmation list.
 
-Before installing, upgrading, or removing packages, `dpm` lists the package
-names and versions that will change and asks for confirmation. Enter `y` (or
-`是`) to continue; all other answers cancel. Non-interactive input defaults to
-cancellation. Use `-y`/`--yes` to automatically confirm or `-n`/`--no` to
-automatically cancel confirmation prompts; either option can appear before or
-after the command. They cannot be combined.
+Before installing, reinstalling, upgrading, or removing packages, `dpm` lists
+the package names and versions that will change and asks for confirmation.
+Enter `y` (or `是`) to continue; all other answers cancel. Non-interactive
+input defaults to cancellation. Use `-y`/`--yes` to automatically confirm or
+`-n`/`--no` to automatically cancel confirmation prompts; either option can
+appear before or after the command. They cannot be combined.
 
-During install, upgrade, and removal, the progress display is based on dpkg's
-machine-readable package status events: completed packages advance the bar.
+During install, reinstall, upgrade, and removal, the progress display is based
+on dpkg's machine-readable package status events: completed packages advance
+the bar.
 dpkg does not report a byte-level percentage for unpacking/configuring a single
 package, so the bar can remain still while that package is being processed; it
 does not invent intermediate progress.
