@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.22_arm64.deb
+sudo dpkg -i dist/dpm_0.1.24_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -42,10 +42,17 @@ deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie-updates main contrib non
 deb https://mirrors.tuna.tsinghua.edu.cn/debian-security/ trixie-security main contrib non-free non-free-firmware
 ```
 
-Only traditional `.list` entries beginning with `deb` are supported; `.sources`
-files and `deb-src` entries are not supported. Binary `.gpg` signing keyrings
-must already be available in `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/`,
-or `/usr/share/keyrings/`. Unsigned repositories are rejected.
+Traditional `.list` entries beginning with `deb` are supported, including flat
+repositories using `./` as the suite, for example:
+
+```text
+deb https://d.spark-app.store/aarch64-store ./
+```
+
+Both clear-signed `InRelease` and detached `Release.gpg` metadata are verified;
+unsigned repositories are rejected. `.sources` files and `deb-src` entries are
+not supported. Binary `.gpg` signing keyrings must already be available in
+`/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/`, or `/usr/share/keyrings/`.
 
 Indexes are stored in `/var/cache/dpm/list`; verified `.deb` files are stored
 in `/var/cache/dpm/deb`.

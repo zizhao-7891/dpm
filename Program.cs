@@ -167,16 +167,19 @@ internal static class Program
             .ToList();
         if (applicableSources.Count == 0)
             throw new InvalidOperationException($"No configured repository supports architecture {architecture}.");
-        var total = applicableSources.Sum(s => s.Components.Count);
+        var total = applicableSources.Sum(source => source.IsFlat ? 1 : source.Components.Count);
         var done = 0;
         var unchanged = 0;
         RenderIndexProgress(done, total);
         foreach (var source in applicableSources)
-        foreach (var component in source.Components)
         {
-            if (!await UpdateIndexAsync(source, component, architecture, keyrings))
-                unchanged++;
-            RenderIndexProgress(++done, total);
+            var components = source.IsFlat ? new string?[] { null } : source.Components.Select(component => (string?)component);
+            foreach (var component in components)
+            {
+                if (!await UpdateIndexAsync(source, component, architecture, keyrings))
+                    unchanged++;
+                RenderIndexProgress(++done, total);
+            }
         }
         if (unchanged > 0)
             Console.WriteLine($"有 {unchanged} 个本地索引与服务器一致，已跳过下载。");
@@ -197,26 +200,45 @@ internal static class Program
             Console.WriteLine();
     }
 
-    private static async Task<bool> UpdateIndexAsync(RepositorySource source, string component, string architecture, IReadOnlyList<string> keyrings)
+    private static async Task<bool> UpdateIndexAsync(
+        RepositorySource source,
+        string? component,
+        string architecture,
+        IReadOnlyList<string> keyrings)
     {
-        var distUri = EnsureTrailingSlash(source.Uri) + "dists/" + Uri.EscapeDataString(source.Suite) + "/";
+        var distUri = source.IsFlat
+            ? EnsureTrailingSlash(source.Uri)
+            : EnsureTrailingSlash(source.Uri) + "dists/" + Uri.EscapeDataString(source.Suite) + "/";
         var temp = Path.Combine(Path.GetTempPath(), "dpm-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(temp);
         try
         {
             var releasePath = Path.Combine(temp, "Release");
-            var signaturePath = Path.Combine(temp, "Release.gpg");
-            await DownloadToFileAsync(new Uri(distUri + "Release"), releasePath);
-            await DownloadToFileAsync(new Uri(distUri + "Release.gpg"), signaturePath);
-            await VerifyReleaseAsync(signaturePath, releasePath, keyrings);
+            var inReleasePath = Path.Combine(temp, "InRelease");
+            if (await TryDownloadToFileAsync(new Uri(distUri + "InRelease"), inReleasePath))
+                await VerifyInReleaseAsync(inReleasePath, releasePath, keyrings);
+            else
+            {
+                await DownloadToFileAsync(new Uri(distUri + "Release"), releasePath);
+                var signaturePath = Path.Combine(temp, "Release.gpg");
+                await DownloadToFileAsync(new Uri(distUri + "Release.gpg"), signaturePath);
+                await VerifyReleaseAsync(signaturePath, releasePath, keyrings);
+            }
 
             var releaseText = await File.ReadAllTextAsync(releasePath);
             var checksums = ParseSha256(releaseText);
             string? relativePath = null;
             string? expectedHash = null;
-            foreach (var suffix in new[] { "Packages.xz", "Packages.gz", "Packages" })
+            var indexPaths = source.IsFlat
+                ? new[] { "Packages.xz", "Packages.gz", "Packages" }
+                : new[]
+                {
+                    $"{component}/binary-{architecture}/Packages.xz",
+                    $"{component}/binary-{architecture}/Packages.gz",
+                    $"{component}/binary-{architecture}/Packages"
+                };
+            foreach (var candidate in indexPaths)
             {
-                var candidate = $"{component}/binary-{architecture}/{suffix}";
                 if (checksums.TryGetValue(candidate, out var hash))
                 {
                     relativePath = candidate;
@@ -225,7 +247,9 @@ internal static class Program
                 }
             }
             if (relativePath is null || expectedHash is null)
-                throw new InvalidDataException($"No signed package index found for {component}/{architecture}.");
+                throw new InvalidDataException(source.IsFlat
+                    ? $"No signed flat package index found for {source.Uri}."
+                    : $"No signed package index found for {component}/{architecture}.");
 
             var id = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
                 $"{source.Uri}|{source.Suite}|{component}|{architecture}"))).ToLowerInvariant()[..20];
@@ -235,7 +259,7 @@ internal static class Program
             var metadata = new IndexCacheMetadata(
                 source.Uri,
                 source.Suite,
-                component,
+                component ?? "",
                 architecture,
                 relativePath,
                 expectedHash);
@@ -314,6 +338,23 @@ internal static class Program
         var result = await RunProcessAsync("gpgv", arguments);
         if (result.ExitCode != 0 || !result.Output.Contains("[GNUPG:] VALIDSIG ", StringComparison.Ordinal))
             throw new InvalidDataException($"Repository Release signature verification failed: {result.Error.Trim()}");
+    }
+
+    private static async Task VerifyInReleaseAsync(
+        string inRelease,
+        string release,
+        IReadOnlyList<string> keyrings)
+    {
+        var arguments = new List<string> { "--status-fd", "1", "--output", release };
+        foreach (var keyring in keyrings)
+        {
+            arguments.Add("--keyring");
+            arguments.Add(keyring);
+        }
+        arguments.Add(inRelease);
+        var result = await RunProcessAsync("gpgv", arguments);
+        if (result.ExitCode != 0 || !result.Output.Contains("[GNUPG:] VALIDSIG ", StringComparison.Ordinal))
+            throw new InvalidDataException($"Repository InRelease signature verification failed: {result.Error.Trim()}");
     }
 
     private static Dictionary<string, string> ParseSha256(string release)
@@ -960,7 +1001,7 @@ internal static class Program
         var temp = destination + "." + Guid.NewGuid().ToString("N") + ".part";
         try
         {
-            var relative = package.Filename.Replace('\\', '/');
+            var relative = GetPackageRelativePath(package);
             var uri = new Uri(EnsureTrailingSlash(package.RepositoryUri) + relative);
             var downloadedBytes = await DownloadPackageWithProgressAsync(uri, temp, package, progress);
             if (!await HasHashAsync(temp, package.Sha256))
@@ -977,12 +1018,20 @@ internal static class Program
 
     private static string GetPackageCachePath(PackageRecord package)
     {
+        var relative = GetPackageRelativePath(package);
+        return Path.Combine(PackageDirectory, Path.GetFileName(relative));
+    }
+
+    private static string GetPackageRelativePath(PackageRecord package)
+    {
         if (string.IsNullOrWhiteSpace(package.Filename) || string.IsNullOrWhiteSpace(package.Sha256))
             throw new InvalidDataException($"Package {package.Name} is missing its filename or SHA256.");
         var relative = package.Filename.Replace('\\', '/');
+        if (relative.StartsWith("./", StringComparison.Ordinal))
+            relative = relative[2..];
         if (relative.StartsWith('/') || relative.Split('/').Any(part => part is "" or "." or ".."))
             throw new InvalidDataException($"Unsafe package path in index for {package.Name}.");
-        return Path.Combine(PackageDirectory, Path.GetFileName(relative));
+        return relative;
     }
 
     private static async Task<long> DownloadPackageWithProgressAsync(
@@ -1312,6 +1361,19 @@ internal static class Program
         await input.CopyToAsync(output);
     }
 
+    private static async Task<bool> TryDownloadToFileAsync(Uri uri, string path)
+    {
+        using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            return false;
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
+        await using var input = await response.Content.ReadAsStreamAsync();
+        await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
+        await input.CopyToAsync(output);
+        return true;
+    }
+
     private static async Task<bool> HasHashAsync(string path, string expected)
     {
         await using var stream = File.OpenRead(path);
@@ -1329,7 +1391,7 @@ internal static class Program
             var line = raw.Trim();
             if (line.Length == 0 || line.StartsWith('#')) continue;
             var parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 4 || parts[0] != "deb")
+            if (parts.Length < 3 || parts[0] != "deb")
                 throw new InvalidDataException($"Unsupported source entry in {file}: {line}");
             var start = 1;
             string? configuredArchitecture = null;
@@ -1341,11 +1403,20 @@ internal static class Program
                 if (option is not null) configuredArchitecture = option["arch=".Length..];
                 start = end + 1;
             }
-            if (parts.Length < start + 3 || !Uri.TryCreate(parts[start], UriKind.Absolute, out var uri) ||
+            if (parts.Length < start + 2 || !Uri.TryCreate(parts[start], UriKind.Absolute, out var uri) ||
                 uri.Scheme is not ("http" or "https"))
                 throw new InvalidDataException($"Invalid source URI in {file}: {line}");
-            result.Add(new RepositorySource(uri.ToString(), parts[start + 1], parts.Skip(start + 2).ToList(),
-                configuredArchitecture?.Split(',', StringSplitOptions.RemoveEmptyEntries)));
+            var isFlat = parts[start + 1] == "./";
+            if (!isFlat && parts.Length < start + 3)
+                throw new InvalidDataException($"Missing repository components in {file}: {line}");
+            if (isFlat && parts.Length != start + 2)
+                throw new InvalidDataException($"Flat repository entries must not specify components in {file}: {line}");
+            result.Add(new RepositorySource(
+                uri.ToString(),
+                parts[start + 1],
+                isFlat ? [] : parts.Skip(start + 2).ToList(),
+                configuredArchitecture?.Split(',', StringSplitOptions.RemoveEmptyEntries),
+                isFlat));
         }
         return result;
     }
@@ -1476,7 +1547,12 @@ internal static class Program
     [System.Runtime.InteropServices.DllImport("libc")]
     private static extern uint geteuid();
 
-    private sealed record RepositorySource(string Uri, string Suite, List<string> Components, string[]? Architectures);
+    private sealed record RepositorySource(
+        string Uri,
+        string Suite,
+        List<string> Components,
+        string[]? Architectures,
+        bool IsFlat);
     private sealed record IndexCacheMetadata(
         string SourceUri,
         string Suite,
