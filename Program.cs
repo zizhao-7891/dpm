@@ -809,14 +809,30 @@ internal static class Program
         if (versionStart >= 0)
         {
             var versionEnd = value.IndexOf(')', versionStart + 1);
-            if (versionEnd < 0)
+            if (versionEnd < 0 || !string.IsNullOrWhiteSpace(value[(versionEnd + 1)..]))
                 throw new InvalidDataException($"Malformed package dependency: {expression}");
             var versionFields = value[(versionStart + 1)..versionEnd]
                 .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
-            if (versionFields.Length != 2)
+            if (versionFields.Length == 2)
+            {
+                relation = versionFields[0];
+                version = versionFields[1];
+            }
+            else if (versionFields.Length == 1)
+            {
+                foreach (var candidate in new[] { "<<", "<=", ">>", ">=", "==", "=", "<", ">" })
+                {
+                    if (!versionFields[0].StartsWith(candidate, StringComparison.Ordinal) ||
+                        versionFields[0].Length == candidate.Length)
+                        continue;
+                    relation = candidate;
+                    version = versionFields[0][candidate.Length..];
+                    break;
+                }
+            }
+            if (relation is null || version is null ||
+                relation is not ("=" or "==" or "<<" or "<" or "<=" or ">>" or ">" or ">="))
                 throw new InvalidDataException($"Malformed package version constraint: {expression}");
-            relation = versionFields[0];
-            version = versionFields[1];
             value = value[..versionStart].Trim();
         }
 
