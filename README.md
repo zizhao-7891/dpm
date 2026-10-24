@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.25_arm64.deb
+sudo dpkg -i dist/dpm_0.1.26_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -80,7 +80,9 @@ including version constraints, alternative dependencies, and virtual packages
 declared by `Provides`. Already-installed satisfying packages are reused;
 missing dependencies are selected from the signed package indexes, included in
 the confirmation list, downloaded, and passed to `dpkg` together with the
-requested packages. `Recommends` and `Suggests` are not installed automatically.
+requested packages. Packages are ordered so selected `Pre-Depends` are
+installed before their dependents. `Recommends` and `Suggests` are not
+installed automatically.
 
 `reinstall` requires the package to be installed and its exact installed version
 to be available in the configured repositories. It reinstalls that version

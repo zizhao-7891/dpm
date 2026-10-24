@@ -381,10 +381,11 @@ internal static class Program
         if (root is null) throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
         var installed = await GetInstalledAsync();
         var plan = ResolveDependencies([root], installed);
+        var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("安装", changes))
             return;
-        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
+        var files = await DownloadPackagesAsync(orderedPlan);
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
@@ -407,11 +408,12 @@ internal static class Program
                 $"Package '{current.Key}' version {current.Value.Version} is not available in the configured repositories.");
 
         var plan = ResolveDependencies([root], installed);
+        var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("重新安装", changes))
             return;
 
-        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
+        var files = await DownloadPackagesAsync(orderedPlan);
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
@@ -471,11 +473,12 @@ internal static class Program
         }
 
         var plan = ResolveDependencies(candidates.Select(item => item.Candidate).ToList(), installed);
+        var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("升级", changes))
             return;
 
-        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
+        var files = await DownloadPackagesAsync(orderedPlan);
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
@@ -747,6 +750,71 @@ internal static class Program
             {
                 visiting.Remove(package.Name);
             }
+        }
+    }
+
+    private static IReadOnlyList<PackageRecord> OrderPackagesForInstall(
+        IReadOnlyDictionary<string, PackageRecord> plan,
+        IReadOnlyDictionary<string, InstalledPackage> installed)
+    {
+        var dependencies = plan.Values.ToDictionary(
+            package => package.Name,
+            _ => new HashSet<string>(StringComparer.Ordinal),
+            StringComparer.Ordinal);
+
+        foreach (var package in plan.Values)
+        foreach (var group in ParseDependencyGroups(package.PreDepends))
+        {
+            PackageRecord? selectedDependency = null;
+            foreach (var alternative in group)
+            {
+                selectedDependency = plan.Values
+                    .Where(candidate => PackageSatisfies(candidate, alternative))
+                    .OrderBy(candidate => candidate.Name, StringComparer.Ordinal)
+                    .FirstOrDefault();
+                if (selectedDependency is not null)
+                    break;
+            }
+
+            if (selectedDependency is not null)
+            {
+                dependencies[package.Name].Add(selectedDependency.Name);
+                continue;
+            }
+
+            var satisfiedByInstalled = group.Any(alternative =>
+                installed.Any(entry =>
+                    !plan.Values.Any(candidate => PackageNameMatches(entry.Key, candidate.Name)) &&
+                    InstalledPackageSatisfies(entry.Value, entry.Key, alternative)));
+            if (!satisfiedByInstalled)
+            {
+                var expression = string.Join(" | ", group.Select(FormatDependency));
+                throw new InvalidOperationException(
+                    $"Cannot order unresolved pre-dependency '{expression}' required by {package.Name} {package.Version}.");
+            }
+        }
+
+        var states = new Dictionary<string, byte>(StringComparer.Ordinal);
+        var ordered = new List<PackageRecord>(plan.Count);
+        foreach (var package in plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
+            Visit(package);
+        return ordered;
+
+        void Visit(PackageRecord package)
+        {
+            if (states.TryGetValue(package.Name, out var state))
+            {
+                if (state == 1)
+                    throw new InvalidOperationException(
+                        $"Circular Pre-Depends detected while ordering package {package.Name}.");
+                return;
+            }
+
+            states[package.Name] = 1;
+            foreach (var dependencyName in dependencies[package.Name].Order(StringComparer.Ordinal))
+                Visit(plan[dependencyName]);
+            states[package.Name] = 2;
+            ordered.Add(package);
         }
     }
 
