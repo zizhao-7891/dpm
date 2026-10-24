@@ -9,7 +9,7 @@ STAGE="$ROOT/.package-root"
 PUBLISH="$ROOT/.publish"
 
 case "$ARCH" in
-    arm64|amd64) ;;
+    arm64|amd64|armhf) ;;
     *)
         echo "Unsupported package architecture: $ARCH" >&2
         exit 2
@@ -23,7 +23,11 @@ case "$VERSION" in
         ;;
 esac
 
-RID="linux-$ARCH"
+case "$ARCH" in
+    armhf) RID=linux-arm ;;
+    *) RID="linux-$ARCH" ;;
+esac
+
 rm -rf "$STAGE" "$PUBLISH"
 mkdir -p "$OUTPUT" "$STAGE/DEBIAN" "$STAGE/etc/dpm/sources.list.d" "$STAGE/usr/bin" "$STAGE/usr/share/doc/dpm" "$STAGE/usr/share/doc/dpm/examples"
 

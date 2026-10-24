@@ -8,19 +8,20 @@ checked against SHA-256 hashes from the signed Release metadata.
 
 ## Build and install
 
-Build a self-contained Debian package for the current supported target
-architecture (`arm64` by default):
+Build a self-contained Debian package for `arm64` (default), `amd64`, or
+`armhf`:
 
 ```sh
 ./build-deb.sh
 sudo dpkg -i dist/dpm_0.1.20_arm64.deb
 ```
 
-The build requires the .NET 8 SDK and `dpkg-deb`. Override `ARCH` with `amd64`
-or set `VERSION` to customize the package:
+The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
+supported architecture or `VERSION` to customize the package:
 
 ```sh
 ARCH=amd64 VERSION=0.2.0 ./build-deb.sh
+ARCH=armhf VERSION=0.2.0 ./build-deb.sh
 ```
 
 The package includes the .NET runtime and installs the Tsinghua mirror source
