@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -342,9 +343,7 @@ internal static class Program
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("安装", changes))
             return;
-        var files = new List<string>();
-        foreach (var package in plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
-            files.Add(await DownloadPackageAsync(package));
+        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
@@ -371,9 +370,7 @@ internal static class Program
         if (!ConfirmPackageChanges("重新安装", changes))
             return;
 
-        var files = new List<string>();
-        foreach (var package in plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
-            files.Add(await DownloadPackageAsync(package));
+        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
@@ -437,9 +434,7 @@ internal static class Program
         if (!ConfirmPackageChanges("升级", changes))
             return;
 
-        var files = new List<string>();
-        foreach (var package in plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
-            files.Add(await DownloadPackageAsync(package));
+        var files = await DownloadPackagesAsync(plan.Values.OrderBy(package => package.Name, StringComparer.Ordinal));
         await RunDpkgAsync(["--install", .. files], files.Count, true);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
@@ -901,7 +896,7 @@ internal static class Program
     {
         var candidate = SelectCandidate(packageName);
         if (candidate is null) throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
-        var file = await DownloadPackageAsync(candidate);
+        var file = (await DownloadPackagesAsync([candidate])).Single();
         Console.WriteLine($"已下载: {file}");
     }
 
@@ -933,26 +928,45 @@ internal static class Program
         return $"{size:0.##} {units[unit]}";
     }
 
-    private static async Task<string> DownloadPackageAsync(PackageRecord package)
+    private static async Task<List<string>> DownloadPackagesAsync(IEnumerable<PackageRecord> packages)
     {
-        if (string.IsNullOrWhiteSpace(package.Filename) || string.IsNullOrWhiteSpace(package.Sha256))
-            throw new InvalidDataException($"Package {package.Name} is missing its filename or SHA256.");
-        var relative = package.Filename.Replace('\\', '/');
-        if (relative.StartsWith('/') || relative.Split('/').Any(part => part is "" or "." or ".."))
-            throw new InvalidDataException($"Unsafe package path in index for {package.Name}.");
-        var name = Path.GetFileName(relative);
-        var destination = Path.Combine(PackageDirectory, name);
+        var packageList = packages.ToList();
+        var cachedFiles = new Dictionary<PackageRecord, string>();
+        var pending = new List<PackageRecord>();
+        foreach (var package in packageList)
+        {
+            var destination = GetPackageCachePath(package);
+            if (File.Exists(destination) && await HasHashAsync(destination, package.Sha256))
+                cachedFiles[package] = destination;
+            else
+                pending.Add(package);
+        }
+
+        var progress = pending.Count == 0 ? null : new PackageDownloadProgress(pending);
+        foreach (var package in pending)
+            cachedFiles[package] = await DownloadPackageAsync(package, progress);
+
+        return packageList.Select(package => cachedFiles[package]).ToList();
+    }
+
+    private static async Task<string> DownloadPackageAsync(
+        PackageRecord package,
+        PackageDownloadProgress? progress = null)
+    {
+        var destination = GetPackageCachePath(package);
         if (File.Exists(destination) && await HasHashAsync(destination, package.Sha256))
             return destination;
 
         var temp = destination + "." + Guid.NewGuid().ToString("N") + ".part";
         try
         {
+            var relative = package.Filename.Replace('\\', '/');
             var uri = new Uri(EnsureTrailingSlash(package.RepositoryUri) + relative);
-            await DownloadPackageWithProgressAsync(uri, temp, package.Name);
+            var downloadedBytes = await DownloadPackageWithProgressAsync(uri, temp, package, progress);
             if (!await HasHashAsync(temp, package.Sha256))
                 throw new InvalidDataException($"SHA256 mismatch for package {package.Name}; downloaded file was rejected.");
             File.Move(temp, destination, true);
+            progress?.CompletePackage(downloadedBytes);
             return destination;
         }
         finally
@@ -961,7 +975,21 @@ internal static class Program
         }
     }
 
-    private static async Task DownloadPackageWithProgressAsync(Uri uri, string path, string packageName)
+    private static string GetPackageCachePath(PackageRecord package)
+    {
+        if (string.IsNullOrWhiteSpace(package.Filename) || string.IsNullOrWhiteSpace(package.Sha256))
+            throw new InvalidDataException($"Package {package.Name} is missing its filename or SHA256.");
+        var relative = package.Filename.Replace('\\', '/');
+        if (relative.StartsWith('/') || relative.Split('/').Any(part => part is "" or "." or ".."))
+            throw new InvalidDataException($"Unsafe package path in index for {package.Name}.");
+        return Path.Combine(PackageDirectory, Path.GetFileName(relative));
+    }
+
+    private static async Task<long> DownloadPackageWithProgressAsync(
+        Uri uri,
+        string path,
+        PackageRecord package,
+        PackageDownloadProgress? progress)
     {
         using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
         if (!response.IsSuccessStatusCode)
@@ -974,7 +1002,8 @@ internal static class Program
         long downloaded = 0;
         var stopwatch = Stopwatch.StartNew();
         var lastUpdate = TimeSpan.Zero;
-        RenderPackageDownloadProgress(packageName, downloaded, totalBytes, stopwatch.Elapsed, totalBytes is 0);
+        progress?.StartPackage(package, totalBytes);
+        RenderDownloadProgress(package.Name, downloaded, totalBytes, stopwatch.Elapsed, progress, totalBytes is 0);
 
         while (true)
         {
@@ -984,22 +1013,38 @@ internal static class Program
             downloaded += read;
             if (stopwatch.Elapsed - lastUpdate >= TimeSpan.FromMilliseconds(200))
             {
-                RenderPackageDownloadProgress(packageName, downloaded, totalBytes, stopwatch.Elapsed);
+                RenderDownloadProgress(package.Name, downloaded, totalBytes, stopwatch.Elapsed, progress);
                 lastUpdate = stopwatch.Elapsed;
             }
         }
 
         await output.FlushAsync();
         stopwatch.Stop();
-        RenderPackageDownloadProgress(packageName, downloaded, totalBytes, stopwatch.Elapsed, true);
+        RenderDownloadProgress(package.Name, downloaded, totalBytes, stopwatch.Elapsed, progress, true);
+        return downloaded;
     }
 
-    private static void RenderPackageDownloadProgress(
+    private static void RenderDownloadProgress(
         string packageName,
         long downloadedBytes,
         long? totalBytes,
         TimeSpan elapsed,
+        PackageDownloadProgress? progress,
         bool complete = false)
+    {
+        var packageMessage = FormatPackageDownloadProgress(packageName, downloadedBytes, totalBytes, elapsed, complete);
+        if (progress is null)
+            WriteProgressLine(packageMessage, complete);
+        else
+            progress.Render(packageMessage, downloadedBytes);
+    }
+
+    private static string FormatPackageDownloadProgress(
+        string packageName,
+        long downloadedBytes,
+        long? totalBytes,
+        TimeSpan elapsed,
+        bool complete)
     {
         var percent = totalBytes is > 0
             ? Math.Clamp((int)(downloadedBytes * 100L / totalBytes.Value), 0, complete ? 100 : 99)
@@ -1012,7 +1057,11 @@ internal static class Program
         var remaining = totalBytes is > 0 && speed > 0
             ? $"{Math.Ceiling(Math.Max(0, totalBytes.Value - downloadedBytes) / (speed * 1_000_000d)):0}s"
             : totalBytes is > 0 ? "--" : "?";
-        var message = $"{packageName} {speed:0.00} MB/s [{bar}] {percent}% {remaining}";
+        return $"{packageName} {speed:0.00} MB/s [{bar}] {percent}% {remaining}";
+    }
+
+    private static void WriteProgressLine(string message, bool complete)
+    {
         if (Console.IsOutputRedirected)
             Console.WriteLine(message);
         else
@@ -1059,12 +1108,17 @@ internal static class Program
                     !fields.TryGetValue("Filename", out var filename))
                     continue;
                 fields.TryGetValue("SHA256", out var hash);
+                var size = fields.TryGetValue("Size", out var sizeText) &&
+                           long.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out var parsedSize) &&
+                           parsedSize >= 0
+                    ? parsedSize
+                    : (long?)null;
                 fields.TryGetValue("Description", out var description);
                 fields.TryGetValue("Pre-Depends", out var preDepends);
                 fields.TryGetValue("Depends", out var depends);
                 fields.TryGetValue("Provides", out var provides);
                 result.Add(new PackageRecord(name, version, filename, hash ?? "", description ?? "",
-                    sourceUri, preDepends ?? "", depends ?? "", provides ?? ""));
+                    sourceUri, preDepends ?? "", depends ?? "", provides ?? "", size));
             }
         }
         return result;
@@ -1322,6 +1376,102 @@ internal static class Program
 
     private static uint GetEffectiveUid() => geteuid();
 
+    private sealed class PackageDownloadProgress
+    {
+        private readonly int _packageCount;
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private long? _totalBytes;
+        private long _completedBytes;
+        private long _currentBytes;
+        private long? _currentExpectedBytes;
+        private int _completedPackages;
+        private string _currentPackageLine = "";
+        private bool _started;
+
+        public PackageDownloadProgress(IReadOnlyList<PackageRecord> packages)
+        {
+            _packageCount = packages.Count;
+            if (packages.All(package => package.Size.HasValue))
+                _totalBytes = packages.Sum(package => package.Size!.Value);
+        }
+
+        public void StartPackage(PackageRecord package, long? responseBytes)
+        {
+            _currentBytes = 0;
+            _currentExpectedBytes = responseBytes is >= 0 ? responseBytes : package.Size;
+            if (_totalBytes is long total && package.Size is long indexedSize &&
+                _currentExpectedBytes is long expectedSize)
+            {
+                _totalBytes = Math.Max(0, total - indexedSize + expectedSize);
+            }
+        }
+
+        public void Render(string packageLine, long downloadedBytes)
+        {
+            _currentPackageLine = packageLine;
+            _currentBytes = downloadedBytes;
+            Draw();
+        }
+
+        public void CompletePackage(long downloadedBytes)
+        {
+            if (_totalBytes is long total && _currentExpectedBytes is long expectedSize)
+                _totalBytes = Math.Max(0, total - expectedSize + downloadedBytes);
+            _completedBytes += downloadedBytes;
+            _currentBytes = 0;
+            _completedPackages++;
+            Draw();
+            if (_completedPackages == _packageCount && !Console.IsOutputRedirected)
+                Console.WriteLine();
+        }
+
+        private void Draw()
+        {
+            var bytesTransferred = _completedBytes + _currentBytes;
+            var percent = _totalBytes is > 0
+                ? Math.Clamp((int)(bytesTransferred * 100d / _totalBytes.Value), 0, 99)
+                : Math.Clamp(_completedPackages * 100 / _packageCount, 0, 99);
+            if (_completedPackages == _packageCount)
+                percent = 100;
+
+            const int width = 20;
+            var filled = percent * width / 100;
+            var bar = new string('#', filled) + new string(' ', width - filled);
+            var seconds = _stopwatch.Elapsed.TotalSeconds;
+            var speed = seconds > 0 ? bytesTransferred / seconds / 1_000_000d : 0d;
+            var remaining = _totalBytes is long totalBytes && speed > 0
+                ? Math.Ceiling(Math.Max(0, totalBytes - bytesTransferred) / (speed * 1_000_000d))
+                : _completedPackages == _packageCount ? 0 : (double?)null;
+            var eta = remaining is double secondsRemaining
+                ? FormatRemainingTime(secondsRemaining)
+                : "?";
+            var summary = $"总共[{_completedPackages}/{_packageCount}] [{bar}] {percent}% {speed:0.00} MB/s {eta}";
+
+            if (Console.IsOutputRedirected)
+            {
+                Console.WriteLine(_currentPackageLine);
+                Console.WriteLine(summary);
+            }
+            else if (!_started)
+            {
+                Console.WriteLine(_currentPackageLine);
+                Console.Write(summary);
+                _started = true;
+            }
+            else
+                Console.Write($"\u001b[1A\r{_currentPackageLine}\u001b[K\n\r{summary}\u001b[K");
+        }
+
+        private static string FormatRemainingTime(double seconds)
+        {
+            var totalSeconds = (long)Math.Ceiling(seconds);
+            var hours = totalSeconds / 3600;
+            var minutes = totalSeconds % 3600 / 60;
+            var remainingSeconds = totalSeconds % 60;
+            return $"{hours}h {minutes}m {remainingSeconds}s";
+        }
+    }
+
     [System.Runtime.InteropServices.DllImport("libc")]
     private static extern uint geteuid();
 
@@ -1342,7 +1492,8 @@ internal static class Program
         string RepositoryUri,
         string PreDepends,
         string Depends,
-        string Provides);
+        string Provides,
+        long? Size);
     private sealed record DependencyAlternative(string Name, string? Relation, string? Version);
     private sealed record PackageChange(string Name, string? CurrentVersion, string? TargetVersion, string? Reason = null);
     private sealed record InstalledPackage(string Version, string Provides, string PreDepends, string Depends);

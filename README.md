@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.21_arm64.deb
+sudo dpkg -i dist/dpm_0.1.22_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -108,9 +108,12 @@ prematurely. On every update, the signed Release file is checked first; if its
 index path and SHA256 match the cached index metadata, the large package index
 is not downloaded again.
 
-Package downloads show the measured transfer speed, received-byte percentage,
-and estimated remaining seconds. If the server does not provide the total
-download size, the percentage and ETA are shown as unknown rather than guessed.
+Package downloads show the per-package transfer progress plus an overall
+`总共[已完成/总数]` progress line. The overall bar uses signed package sizes,
+with aggregate measured speed and estimated remaining time; if package sizes
+are unavailable, it falls back to completed-package progress rather than
+inventing a byte percentage. The per-package line shows received-byte
+percentage and estimated remaining seconds.
 
 `dpm clear` shows the number and total size of cached `.deb` archives and asks
 for confirmation before deleting them. Package indexes are kept; `dpm clear
