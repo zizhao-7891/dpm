@@ -726,6 +726,7 @@ internal static class Program
         var selectedByProvide = new Dictionary<string, List<PackageRecord>>(StringComparer.Ordinal);
         var installedIndex = BuildInstalledDependencyIndex(installed);
         var visiting = new HashSet<string>(StringComparer.Ordinal);
+        var resolved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var root in roots)
         {
             AddSelected(root);
@@ -749,7 +750,7 @@ internal static class Program
 
         void ResolvePackage(PackageRecord package)
         {
-            if (!visiting.Add(package.Name))
+            if (resolved.Contains(package.Name) || !visiting.Add(package.Name))
                 return;
             try
             {
@@ -771,7 +772,10 @@ internal static class Program
                             !selectedByName.ContainsKey(GetPackageBaseName(entry.Key)) &&
                             InstalledPackageSatisfies(entry.Value, entry.Key, alternative)));
                     if (satisfiedByInstalled)
+                    {
+                        ExpandInstalledMetapackage(dependency);
                         continue;
+                    }
 
                     PackageRecord? candidate = null;
                     foreach (var alternative in dependency)
@@ -808,10 +812,35 @@ internal static class Program
                         ResolvePackage(candidate);
                     }
                 }
+                resolved.Add(package.Name);
             }
             finally
             {
                 visiting.Remove(package.Name);
+            }
+        }
+
+        void ExpandInstalledMetapackage(IReadOnlyList<DependencyAlternative> dependency)
+        {
+            foreach (var alternative in dependency)
+            {
+                foreach (var entry in GetInstalledCandidates(installedIndex, alternative))
+                {
+                    var packageName = GetPackageBaseName(entry.Key);
+                    if (selectedByName.ContainsKey(packageName) ||
+                        !InstalledPackageSatisfies(entry.Value, entry.Key, alternative) ||
+                        !availableByName.TryGetValue(packageName, out var availableVersions))
+                        continue;
+
+                    var installedMetapackage = availableVersions.FirstOrDefault(candidate =>
+                        candidate.IsMetaPackage &&
+                        string.Equals(candidate.Version, entry.Value.Version, StringComparison.Ordinal));
+                    if (installedMetapackage is null)
+                        continue;
+
+                    ResolvePackage(installedMetapackage);
+                    return;
+                }
             }
         }
     }

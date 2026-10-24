@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.29_arm64.deb
+sudo dpkg -i dist/dpm_0.1.30_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -82,6 +82,9 @@ declared by `Provides`. When a package is identified as a metapackage, its
 Already-installed satisfying packages are reused; missing dependencies are
 selected from the signed package indexes, included in the confirmation list,
 downloaded, and passed to `dpkg` together with the requested packages.
+Already-installed metapackages encountered in this dependency tree are also
+expanded, so rerunning an install can fill in missing recommended packages
+without reinstalling the metapackage itself.
 Packages are ordered so selected `Pre-Depends` are installed before their
 dependents. `Recommends` for regular packages and all `Suggests` are not
 installed automatically. Package indexes are parsed once per command, and
