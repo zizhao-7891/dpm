@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.26_arm64.deb
+sudo dpkg -i dist/dpm_0.1.29_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -109,7 +109,11 @@ appear before or after the command. They cannot be combined.
 
 During install, reinstall, upgrade, and removal, the progress display is based
 on dpkg's machine-readable package status events: completed packages advance
-the bar.
+the bar. Status events are read from a dedicated redirected descriptor so
+maintainer-script output continues to use the terminal normally. If an install
+fails, dpm retries `dpkg --configure --pending` once and verifies that every
+planned package reached its requested version before treating the transaction
+as recovered.
 dpkg does not report a byte-level percentage for unpacking/configuring a single
 package, so the bar can remain still while that package is being processed; it
 does not invent intermediate progress.

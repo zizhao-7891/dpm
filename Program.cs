@@ -387,7 +387,7 @@ internal static class Program
         if (!ConfirmPackageChanges("安装", changes))
             return;
         var files = await DownloadPackagesAsync(orderedPlan);
-        await RunDpkgAsync(["--install", .. files], files.Count, true);
+        await InstallPackagesAsync(files, orderedPlan);
         var autoInstalled = ReadDpmAutoInstalled();
         autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
@@ -415,7 +415,7 @@ internal static class Program
             return;
 
         var files = await DownloadPackagesAsync(orderedPlan);
-        await RunDpkgAsync(["--install", .. files], files.Count, true);
+        await InstallPackagesAsync(files, orderedPlan);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
         WriteDpmAutoInstalled(autoInstalled);
@@ -480,7 +480,7 @@ internal static class Program
             return;
 
         var files = await DownloadPackagesAsync(orderedPlan);
-        await RunDpkgAsync(["--install", .. files], files.Count, true);
+        await InstallPackagesAsync(files, orderedPlan);
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
         WriteDpmAutoInstalled(autoInstalled);
@@ -498,6 +498,49 @@ internal static class Program
             var wasInstalled = installed.Keys.Any(name => PackageNameMatches(name, package.Name));
             if (!wasInstalled && !requested.Contains(package.Name))
                 autoInstalled.Add(package.Name);
+        }
+    }
+
+    private static async Task InstallPackagesAsync(
+        IReadOnlyList<string> files,
+        IReadOnlyList<PackageRecord> packages)
+    {
+        try
+        {
+            await RunDpkgAsync(["--install", .. files], files.Count, true);
+        }
+        catch (InvalidOperationException installError)
+        {
+            Console.Error.WriteLine(
+                "警告: dpkg 安装未完全成功，正在重试配置待配置的软件包。");
+            try
+            {
+                await RunDpkgAsync(["--configure", "--pending"]);
+            }
+            catch (InvalidOperationException configureError)
+            {
+                throw new InvalidOperationException(
+                    $"{installError.Message} 自动重试配置也失败: {configureError.Message}",
+                    installError);
+            }
+
+            var installed = await GetInstalledAsync();
+            var incomplete = packages
+                .Where(package =>
+                {
+                    var current = installed.FirstOrDefault(entry =>
+                        PackageNameMatches(entry.Key, package.Name));
+                    return current.Key is null ||
+                           !string.Equals(current.Value.Version, package.Version, StringComparison.Ordinal);
+                })
+                .Select(package => $"{package.Name} {package.Version}")
+                .ToList();
+            if (incomplete.Count > 0)
+                throw new InvalidOperationException(
+                    $"{installError.Message} 重试配置后仍未安装或版本不匹配: {string.Join(", ", incomplete)}");
+
+            Console.Error.WriteLine(
+                "警告: 重试配置成功，已确认本次计划中的软件包均已安装。");
         }
     }
 
@@ -1467,14 +1510,16 @@ internal static class Program
             RedirectStandardError = showProgress
         };
         if (showProgress)
-            start.ArgumentList.Add("--status-fd=1");
+            start.ArgumentList.Add("--status-fd=2");
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start dpkg.");
-        Task<string>? errorTask = showProgress ? process.StandardError.ReadToEndAsync() : null;
-        if (showProgress)
-            await ReadDpkgProgressAsync(process, expectedPackageCount);
+        var outputTask = showProgress ? process.StandardOutput.ReadToEndAsync() : null;
+        var errorOutput = showProgress
+            ? await ReadDpkgProgressAsync(process, expectedPackageCount)
+            : "";
         await process.WaitForExitAsync();
-        var errorOutput = errorTask is null ? "" : await errorTask;
+        if (outputTask is not null)
+            await outputTask;
         if (showProgress && process.ExitCode == 0)
             RenderDpkgProgress(expectedPackageCount, expectedPackageCount, null, "完成", true);
         else if (showProgress && !Console.IsOutputRedirected)
@@ -1490,14 +1535,15 @@ internal static class Program
         }
     }
 
-    private static async Task ReadDpkgProgressAsync(Process process, int totalPackages)
+    private static async Task<string> ReadDpkgProgressAsync(Process process, int totalPackages)
     {
         var completed = new HashSet<string>(StringComparer.Ordinal);
+        var diagnostics = new StringBuilder();
         var removing = false;
         string? currentPackage = null;
         string? currentStage = null;
 
-        while (await process.StandardOutput.ReadLineAsync() is { } line)
+        while (await process.StandardError.ReadLineAsync() is { } line)
         {
             if (line.StartsWith("processing: ", StringComparison.Ordinal))
             {
@@ -1526,8 +1572,12 @@ internal static class Program
                     }
                 }
             }
+            else
+            {
+                diagnostics.AppendLine(line);
+            }
         }
-
+        return diagnostics.ToString();
     }
 
     private static void RenderDpkgProgress(

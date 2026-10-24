@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-VERSION=${VERSION:-0.1.28}
+VERSION=${VERSION:-0.1.29}
 ARCH=${ARCH:-arm64}
 OUTPUT="$ROOT/dist"
 STAGE="$ROOT/.package-root"
