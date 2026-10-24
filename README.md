@@ -84,7 +84,9 @@ selected from the signed package indexes, included in the confirmation list,
 downloaded, and passed to `dpkg` together with the requested packages.
 Packages are ordered so selected `Pre-Depends` are installed before their
 dependents. `Recommends` for regular packages and all `Suggests` are not
-installed automatically.
+installed automatically. Package indexes are parsed once per command, and
+dependency lookups use package-name and virtual-provider indexes to keep large
+metapackage plans responsive.
 
 `reinstall` requires the package to be installed and its exact installed version
 to be available in the configured repositories. It reinstalls that version

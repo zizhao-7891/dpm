@@ -26,6 +26,7 @@ internal static class Program
     }
 
     private static ConfirmationMode Confirmation = ConfirmationMode.Prompt;
+    private static List<PackageRecord>? PackageCache;
 
     private static async Task<int> Main(string[] args)
     {
@@ -678,13 +679,30 @@ internal static class Program
             providers.Add(package);
         }
         var selected = new Dictionary<string, PackageRecord>(StringComparer.Ordinal);
+        var selectedByName = new Dictionary<string, List<PackageRecord>>(StringComparer.Ordinal);
+        var selectedByProvide = new Dictionary<string, List<PackageRecord>>(StringComparer.Ordinal);
+        var installedIndex = BuildInstalledDependencyIndex(installed);
         var visiting = new HashSet<string>(StringComparer.Ordinal);
         foreach (var root in roots)
         {
-            selected[root.Name] = root;
+            AddSelected(root);
             ResolvePackage(root);
         }
         return selected;
+
+        void AddSelected(PackageRecord package)
+        {
+            selected[package.Name] = package;
+            AddIndexedPackage(selectedByName, GetPackageBaseName(package.Name), package);
+            if (!string.Equals(package.Name, GetPackageBaseName(package.Name), StringComparison.Ordinal))
+                AddIndexedPackage(selectedByName, package.Name, package);
+            foreach (var provide in SplitDependencyExpression(package.Provides, ','))
+            {
+                var provided = ParseDependencyAlternative(provide);
+                if (provided is not null)
+                    AddIndexedPackage(selectedByProvide, provided.Name, package);
+            }
+        }
 
         void ResolvePackage(PackageRecord package)
         {
@@ -700,17 +718,15 @@ internal static class Program
                 foreach (var dependency in dependencyGroups)
                 {
                     var satisfiedBySelected = dependency.Any(alternative =>
-                        selected.Values.Any(candidate =>
+                        GetPackageCandidates(selectedByName, selectedByProvide, alternative).Any(candidate =>
                             PackageSatisfies(candidate, alternative)));
                     if (satisfiedBySelected)
                         continue;
 
                     var satisfiedByInstalled = dependency.Any(alternative =>
-                        installed.Any(entry =>
-                            !selected.Values.Any(package => PackageNameMatches(entry.Key, package.Name)) &&
-                            ((PackageNameMatches(entry.Key, alternative.Name) &&
-                              VersionSatisfies(entry.Value.Version, alternative)) ||
-                             InstalledProvides(entry.Value.Provides, alternative))));
+                        GetInstalledCandidates(installedIndex, alternative).Any(entry =>
+                            !selectedByName.ContainsKey(GetPackageBaseName(entry.Key)) &&
+                            InstalledPackageSatisfies(entry.Value, entry.Key, alternative)));
                     if (satisfiedByInstalled)
                         continue;
 
@@ -745,7 +761,7 @@ internal static class Program
                     }
                     else
                     {
-                        selected[candidate.Name] = candidate;
+                        AddSelected(candidate);
                         ResolvePackage(candidate);
                     }
                 }
@@ -754,6 +770,33 @@ internal static class Program
             {
                 visiting.Remove(package.Name);
             }
+        }
+    }
+
+    private static void AddIndexedPackage(
+        IDictionary<string, List<PackageRecord>> index,
+        string name,
+        PackageRecord package)
+    {
+        if (!index.TryGetValue(name, out var packages))
+            index[name] = packages = [];
+        packages.Add(package);
+    }
+
+    private static IEnumerable<PackageRecord> GetPackageCandidates(
+        IReadOnlyDictionary<string, List<PackageRecord>> byName,
+        IReadOnlyDictionary<string, List<PackageRecord>> byProvide,
+        DependencyAlternative dependency)
+    {
+        if (byName.TryGetValue(dependency.Name, out var namedPackages))
+        {
+            foreach (var package in namedPackages)
+                yield return package;
+        }
+        if (byProvide.TryGetValue(dependency.Name, out var providers))
+        {
+            foreach (var package in providers)
+                yield return package;
         }
     }
 
@@ -972,10 +1015,7 @@ internal static class Program
             : $"{dependency.Name} ({dependency.Relation} {dependency.Version})";
 
     private static bool IsVersionGreater(string candidate, string current)
-    {
-        var result = RunProcessAsync("dpkg", ["--compare-versions", candidate, "gt", current]).GetAwaiter().GetResult();
-        return result.ExitCode == 0;
-    }
+        => CompareVersions(candidate, current) > 0;
 
     private static bool ConfirmPackageChanges(string action, IReadOnlyList<PackageChange> changes)
     {
@@ -1223,16 +1263,39 @@ internal static class Program
 
     private static int CompareVersions(string left, string right)
     {
-        var result = RunProcessAsync("dpkg", ["--compare-versions", left, "gt", right]).GetAwaiter().GetResult();
-        if (result.ExitCode == 0) return 1;
-        result = RunProcessAsync("dpkg", ["--compare-versions", left, "lt", right]).GetAwaiter().GetResult();
-        return result.ExitCode == 0 ? -1 : 0;
+        var leftEpochEnd = left.IndexOf(':');
+        var rightEpochEnd = right.IndexOf(':');
+        var leftEpoch = leftEpochEnd < 0 ? "0" : left[..leftEpochEnd];
+        var rightEpoch = rightEpochEnd < 0 ? "0" : right[..rightEpochEnd];
+        if (!IsAsciiDigits(leftEpoch) || !IsAsciiDigits(rightEpoch))
+            throw new InvalidDataException($"Invalid Debian package version: {left} or {right}.");
+
+        var epochComparison = CompareNumericStrings(leftEpoch, rightEpoch);
+        if (epochComparison != 0)
+            return epochComparison;
+
+        var leftUpstream = leftEpochEnd < 0 ? left : left[(leftEpochEnd + 1)..];
+        var rightUpstream = rightEpochEnd < 0 ? right : right[(rightEpochEnd + 1)..];
+        var leftRevisionEnd = leftUpstream.LastIndexOf('-');
+        var rightRevisionEnd = rightUpstream.LastIndexOf('-');
+        var leftRevision = leftRevisionEnd < 0 ? "0" : leftUpstream[(leftRevisionEnd + 1)..];
+        var rightRevision = rightRevisionEnd < 0 ? "0" : rightUpstream[(rightRevisionEnd + 1)..];
+        var leftVersion = leftRevisionEnd < 0 ? leftUpstream : leftUpstream[..leftRevisionEnd];
+        var rightVersion = rightRevisionEnd < 0 ? rightUpstream : rightUpstream[..rightRevisionEnd];
+
+        var upstreamComparison = CompareVersionPart(leftVersion, rightVersion);
+        return upstreamComparison != 0
+            ? upstreamComparison
+            : CompareVersionPart(leftRevision, rightRevision);
     }
 
     private static List<PackageRecord> LoadPackages()
     {
+        if (PackageCache is not null)
+            return PackageCache;
         var result = new List<PackageRecord>();
-        if (!Directory.Exists(IndexDirectory)) return result;
+        if (!Directory.Exists(IndexDirectory))
+            return PackageCache = result;
         foreach (var index in Directory.EnumerateFiles(IndexDirectory, "*.Packages", SearchOption.AllDirectories))
         {
             var sourceFile = Path.ChangeExtension(index, ".source");
@@ -1266,7 +1329,74 @@ internal static class Program
                     isMetaPackage, size));
             }
         }
-        return result;
+        return PackageCache = result;
+    }
+
+    private static bool IsAsciiDigits(string value) =>
+        value.Length > 0 && value.All(character => character is >= '0' and <= '9');
+
+    private static int CompareNumericStrings(string left, string right)
+    {
+        left = left.TrimStart('0');
+        right = right.TrimStart('0');
+        var lengthComparison = left.Length.CompareTo(right.Length);
+        return lengthComparison != 0
+            ? lengthComparison
+            : string.Compare(left, right, StringComparison.Ordinal);
+    }
+
+    private static int CompareVersionPart(string left, string right)
+    {
+        var leftIndex = 0;
+        var rightIndex = 0;
+        while (leftIndex < left.Length || rightIndex < right.Length)
+        {
+            while ((leftIndex < left.Length && !IsAsciiDigit(left[leftIndex])) ||
+                   (rightIndex < right.Length && !IsAsciiDigit(right[rightIndex])))
+            {
+                var leftIsNonDigit = leftIndex < left.Length && !IsAsciiDigit(left[leftIndex]);
+                var rightIsNonDigit = rightIndex < right.Length && !IsAsciiDigit(right[rightIndex]);
+                var leftOrder = leftIsNonDigit ? VersionCharacterOrder(left[leftIndex]) : 0;
+                var rightOrder = rightIsNonDigit ? VersionCharacterOrder(right[rightIndex]) : 0;
+                if (leftOrder != rightOrder)
+                    return leftOrder.CompareTo(rightOrder);
+                if (leftIsNonDigit) leftIndex++;
+                if (rightIsNonDigit) rightIndex++;
+            }
+
+            while (leftIndex < left.Length && left[leftIndex] == '0') leftIndex++;
+            while (rightIndex < right.Length && right[rightIndex] == '0') rightIndex++;
+
+            var leftDigitStart = leftIndex;
+            var rightDigitStart = rightIndex;
+            while (leftIndex < left.Length && IsAsciiDigit(left[leftIndex])) leftIndex++;
+            while (rightIndex < right.Length && IsAsciiDigit(right[rightIndex])) rightIndex++;
+            var leftDigitLength = leftIndex - leftDigitStart;
+            var rightDigitLength = rightIndex - rightDigitStart;
+            var digitLengthComparison = leftDigitLength.CompareTo(rightDigitLength);
+            if (digitLengthComparison != 0)
+                return digitLengthComparison;
+            if (leftDigitLength > 0)
+            {
+                var digitComparison = string.Compare(
+                    left, leftDigitStart, right, rightDigitStart, leftDigitLength,
+                    StringComparison.Ordinal);
+                if (digitComparison != 0)
+                    return digitComparison;
+            }
+        }
+
+        return 0;
+    }
+
+    private static bool IsAsciiDigit(char character) => character is >= '0' and <= '9';
+
+    private static int VersionCharacterOrder(char character)
+    {
+        if (character == '~') return -1;
+        if (character == '\0') return 0;
+        if (char.IsAsciiLetter(character)) return character;
+        return character + 256;
     }
 
     private static IEnumerable<Dictionary<string, string>> ParseParagraphs(string text)
