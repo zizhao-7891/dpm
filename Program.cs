@@ -66,9 +66,9 @@ internal static class Program
                     await UpdateAsync();
                     break;
                 case "install":
-                    RequireCount(args, 2);
+                    if (args.Length < 2) throw new ArgumentException("Usage: dpm install PACKAGE [PACKAGE ...]");
                     await UpdateAsync();
-                    await InstallAsync(args[1]);
+                    await InstallAsync(args[1..]);
                     break;
                 case "reinstall":
                     RequireCount(args, 2);
@@ -77,12 +77,12 @@ internal static class Program
                     break;
                 case "remove":
                 case "uninstall":
-                    RequireCount(args, 2);
-                    await RemoveAsync(args[1], false);
+                    if (args.Length < 2) throw new ArgumentException("Usage: dpm remove PACKAGE [PACKAGE ...]");
+                    await RemoveAsync(args[1..], false);
                     break;
                 case "purge":
-                    RequireCount(args, 2);
-                    await RemoveAsync(args[1], true);
+                    if (args.Length < 2) throw new ArgumentException("Usage: dpm purge PACKAGE [PACKAGE ...]");
+                    await RemoveAsync(args[1..], true);
                     break;
                 case "upgrade":
                     if (args.Length > 2) throw new ArgumentException("Usage: dpm upgrade [package]");
@@ -130,11 +130,11 @@ internal static class Program
               dpm [-y | -n] COMMAND [ARGS...]
               dpm update
               dpm up                    (alias for update)
-              dpm install PACKAGE|FILE.deb (updates indexes before installing)
+              dpm install PACKAGE|FILE.deb [PACKAGE|FILE.deb ...] (updates indexes before installing)
               dpm reinstall PACKAGE    (reinstalls the installed package version)
-              dpm remove PACKAGE
-              dpm uninstall PACKAGE    (alias for remove)
-              dpm purge PACKAGE        (remove package and its configuration files)
+              dpm remove PACKAGE [PACKAGE ...]
+              dpm uninstall PACKAGE [PACKAGE ...] (alias for remove)
+              dpm purge PACKAGE [PACKAGE ...] (remove packages and their configuration files)
               dpm upgrade [PACKAGE]
               dpm check                 (dpkg consistency audit)
               dpm check-filesystem      (verify installed package files)
@@ -376,12 +376,28 @@ internal static class Program
         return result;
     }
 
-    private static async Task InstallAsync(string packageName)
+    private static async Task InstallAsync(IReadOnlyList<string> packageArguments)
     {
-        var root = await LoadLocalPackageAsync(packageName) ?? SelectCandidate(packageName);
-        if (root is null) throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
+        var roots = new List<PackageRecord>(packageArguments.Count);
+        foreach (var packageArgument in packageArguments)
+        {
+            var root = await LoadLocalPackageAsync(packageArgument) ?? SelectCandidate(packageArgument);
+            if (root is null)
+                throw new InvalidOperationException(
+                    $"Package '{packageArgument}' was not found in the package indexes.");
+            roots.Add(root);
+        }
+
+        var conflictingRoots = roots
+            .GroupBy(root => root.Name, StringComparer.Ordinal)
+            .FirstOrDefault(group => group.Select(root => root.Version).Distinct(StringComparer.Ordinal).Skip(1).Any());
+        if (conflictingRoots is not null)
+            throw new InvalidOperationException(
+                $"Multiple requested versions of package '{conflictingRoots.Key}' cannot be installed in one transaction.");
+        roots = roots.DistinctBy(root => root.Name, StringComparer.Ordinal).ToList();
+
         var installed = await GetInstalledAsync();
-        var plan = ResolveDependencies([root], installed);
+        var plan = ResolveDependencies(roots, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("安装", changes))
@@ -389,8 +405,8 @@ internal static class Program
         var files = await DownloadPackagesAsync(orderedPlan);
         await InstallPackagesAsync(files, orderedPlan);
         var autoInstalled = ReadDpmAutoInstalled();
-        autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
-        AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
+        autoInstalled.RemoveWhere(name => roots.Any(root => PackageNameMatches(name, root.Name)));
+        AddNewAutomaticDependencies(autoInstalled, plan, installed, roots.Select(root => root.Name));
         WriteDpmAutoInstalled(autoInstalled);
     }
 
@@ -470,13 +486,18 @@ internal static class Program
         WriteDpmAutoInstalled(autoInstalled);
     }
 
-    private static async Task RemoveAsync(string packageName, bool purge)
+    private static async Task RemoveAsync(IReadOnlyList<string> packageNames, bool purge)
     {
         var installed = await GetInstalledAsync();
-        var match = installed.FirstOrDefault(entry => PackageNameMatches(entry.Key, packageName));
-        if (match.Key is null)
-            throw new InvalidOperationException($"Installed package '{packageName}' was not found.");
-        var removalSet = new HashSet<string>([match.Key], StringComparer.Ordinal);
+        var removalSet = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var packageName in packageNames)
+        {
+            var match = installed.FirstOrDefault(entry => PackageNameMatches(entry.Key, packageName));
+            if (match.Key is null)
+                throw new InvalidOperationException($"Installed package '{packageName}' was not found.");
+            removalSet.Add(match.Key);
+        }
+
         var autoInstalled = ReadAutoInstalledPackages();
         var orphans = FindOrphanPackages(installed, autoInstalled, removalSet);
         removalSet.UnionWith(orphans);
@@ -490,7 +511,7 @@ internal static class Program
             if (remaining > 0)
                 details += $"{Environment.NewLine}  ... 还有 {remaining} 个软件包";
             throw new InvalidOperationException(
-                $"无法移除 {match.Key}：仍有未计划移除的软件包依赖它：{Environment.NewLine}{details}");
+                $"无法移除请求的软件包：仍有未计划移除的软件包依赖它们：{Environment.NewLine}{details}");
         }
 
         var changes = removalSet
@@ -498,7 +519,9 @@ internal static class Program
                 name,
                 installed[name].Version,
                 null,
-                name == match.Key ? null : "自动安装的孤儿依赖"))
+                packageNames.Any(packageName => PackageNameMatches(name, packageName))
+                    ? null
+                    : "自动安装的孤儿依赖"))
             .OrderBy(change => change.Name, StringComparer.Ordinal)
             .ToList();
         var action = purge ? "彻底清除" : "卸载";
@@ -827,10 +850,10 @@ internal static class Program
         var visiting = new HashSet<string>(StringComparer.Ordinal);
         var resolved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var root in roots)
-        {
             AddSelected(root);
+
+        foreach (var root in roots)
             ResolvePackage(root);
-        }
         return selected;
 
         void AddSelected(PackageRecord package)

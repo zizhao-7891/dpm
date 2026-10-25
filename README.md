@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.33_arm64.deb
+sudo dpkg -i dist/dpm_0.1.34_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -62,12 +62,12 @@ in `/var/cache/dpm/deb`.
 ```text
 dpm update
 dpm up                    # alias for update
-dpm install PACKAGE       # refreshes indexes before selecting/downloading the package
+dpm install PACKAGE [PACKAGE ...] # refreshes indexes, then installs all requested packages
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm reinstall PACKAGE     # reinstalls the installed version from the repositories
-dpm remove PACKAGE
-dpm uninstall PACKAGE     # alias for remove
-dpm purge PACKAGE         # remove package and its configuration files
+dpm remove PACKAGE [PACKAGE ...]
+dpm uninstall PACKAGE [PACKAGE ...] # alias for remove
+dpm purge PACKAGE [PACKAGE ...] # removes packages and their configuration files
 dpm upgrade [PACKAGE]
 dpm check                 # dpkg --audit
 dpm check-filesystem      # dpkg --verify
