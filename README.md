@@ -63,6 +63,7 @@ in `/var/cache/dpm/deb`.
 dpm update
 dpm up                    # alias for update
 dpm install PACKAGE       # refreshes indexes before selecting/downloading the package
+dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm reinstall PACKAGE     # reinstalls the installed version from the repositories
 dpm remove PACKAGE
 dpm uninstall PACKAGE     # alias for remove
@@ -90,6 +91,11 @@ dependents. `Recommends` for regular packages and all `Suggests` are not
 installed automatically. Package indexes are parsed once per command, and
 dependency lookups use package-name and virtual-provider indexes to keep large
 metapackage plans responsive.
+
+`install` also accepts a local `.deb` path. Its package metadata is read with
+`dpkg-deb`; the package is included in the normal confirmation and installation
+plan, while any missing dependencies are resolved from the configured indexes.
+The local package architecture must match the system or be `all`.
 
 `reinstall` requires the package to be installed and its exact installed version
 to be available in the configured repositories. It reinstalls that version

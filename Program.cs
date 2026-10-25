@@ -130,7 +130,7 @@ internal static class Program
               dpm [-y | -n] COMMAND [ARGS...]
               dpm update
               dpm up                    (alias for update)
-              dpm install PACKAGE       (updates indexes before installing)
+              dpm install PACKAGE|FILE.deb (updates indexes before installing)
               dpm reinstall PACKAGE    (reinstalls the installed package version)
               dpm remove PACKAGE
               dpm uninstall PACKAGE    (alias for remove)
@@ -378,7 +378,7 @@ internal static class Program
 
     private static async Task InstallAsync(string packageName)
     {
-        var root = SelectCandidate(packageName);
+        var root = await LoadLocalPackageAsync(packageName) ?? SelectCandidate(packageName);
         if (root is null) throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
         var installed = await GetInstalledAsync();
         var plan = ResolveDependencies([root], installed);
@@ -392,6 +392,55 @@ internal static class Program
         autoInstalled.RemoveWhere(name => PackageNameMatches(name, root.Name));
         AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
         WriteDpmAutoInstalled(autoInstalled);
+    }
+
+    private static async Task<PackageRecord?> LoadLocalPackageAsync(string packageArgument)
+    {
+        var isPath = File.Exists(packageArgument) ||
+                     Path.IsPathRooted(packageArgument) ||
+                     packageArgument.EndsWith(".deb", StringComparison.OrdinalIgnoreCase) ||
+                     packageArgument.Contains(Path.DirectorySeparatorChar) ||
+                     packageArgument.Contains(Path.AltDirectorySeparatorChar);
+        if (!isPath)
+            return null;
+
+        var path = Path.GetFullPath(packageArgument);
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"Local package file was not found: {packageArgument}");
+
+        var result = await RunProcessAsync("dpkg-deb", ["--field", path]);
+        if (result.ExitCode != 0)
+            throw new InvalidDataException(
+                $"Could not read local Debian package '{packageArgument}': {result.Error.Trim()}");
+
+        var fields = ParseParagraphs(result.Output).FirstOrDefault()
+                     ?? throw new InvalidDataException($"Local package '{packageArgument}' has no control metadata.");
+        if (!fields.TryGetValue("Package", out var name) ||
+            !fields.TryGetValue("Version", out var version) ||
+            !fields.TryGetValue("Architecture", out var packageArchitecture))
+            throw new InvalidDataException(
+                $"Local package '{packageArgument}' is missing Package, Version, or Architecture metadata.");
+
+        var systemArchitecture = await GetArchitectureAsync();
+        if (packageArchitecture != "all" && packageArchitecture != systemArchitecture)
+            throw new InvalidDataException(
+                $"Local package '{packageArgument}' is for {packageArchitecture}, but this system is {systemArchitecture}.");
+
+        fields.TryGetValue("Description", out var description);
+        fields.TryGetValue("Pre-Depends", out var preDepends);
+        fields.TryGetValue("Depends", out var depends);
+        fields.TryGetValue("Provides", out var provides);
+        fields.TryGetValue("Recommends", out var recommends);
+        fields.TryGetValue("Section", out var section);
+        fields.TryGetValue("Tag", out var tags);
+        var isMetaPackage = string.Equals(section, "metapackages", StringComparison.OrdinalIgnoreCase) ||
+                            (tags ?? "").Split([',', ' ', '\t', '\r', '\n'],
+                                StringSplitOptions.RemoveEmptyEntries)
+                            .Contains("role::metapackage", StringComparer.OrdinalIgnoreCase);
+
+        return new PackageRecord(name, version, Path.GetFileName(path), "", description ?? "",
+            "", preDepends ?? "", depends ?? "", provides ?? "", recommends ?? "",
+            isMetaPackage, new FileInfo(path).Length, path);
     }
 
     private static async Task ReinstallAsync(string packageName)
@@ -1176,6 +1225,14 @@ internal static class Program
         var pending = new List<PackageRecord>();
         foreach (var package in packageList)
         {
+            if (package.LocalPath is not null)
+            {
+                if (!File.Exists(package.LocalPath))
+                    throw new FileNotFoundException($"Local package file was not found: {package.LocalPath}");
+                cachedFiles[package] = package.LocalPath;
+                continue;
+            }
+
             var destination = GetPackageCachePath(package);
             if (File.Exists(destination) && await HasHashAsync(destination, package.Sha256))
                 cachedFiles[package] = destination;
@@ -1877,7 +1934,8 @@ internal static class Program
         string Provides,
         string Recommends,
         bool IsMetaPackage,
-        long? Size);
+        long? Size,
+        string? LocalPath = null);
     private sealed record DependencyAlternative(string Name, string? Relation, string? Version);
     private sealed record PackageChange(string Name, string? CurrentVersion, string? TargetVersion, string? Reason = null);
     private sealed record InstalledPackage(string Version, string Provides, string PreDepends, string Depends);
