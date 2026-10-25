@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.30_arm64.deb
+sudo dpkg -i dist/dpm_0.1.33_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -106,8 +106,10 @@ packages and offers to remove them in the same transaction. Only dependencies
 that dpm itself installed are eligible; they are recorded in
 `/var/lib/dpm/auto-installed`. Other packages, including packages managed by
 APT, are never classified or removed as dpm orphans. Dependencies still
-reachable from any other installed package are kept. Orphans are shown
-separately in the confirmation list.
+reachable from any other installed package, including through `Recommends`, are
+kept. Before removal, dpm checks installed `Depends` and `Pre-Depends` and
+refuses to remove a package if any remaining package would be left with an
+unsatisfied dependency. Orphans are shown separately in the confirmation list.
 
 Before installing, reinstalling, upgrading, or removing packages, `dpm` lists
 the package names and versions that will change and asks for confirmation.

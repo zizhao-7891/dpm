@@ -480,6 +480,18 @@ internal static class Program
         var autoInstalled = ReadAutoInstalledPackages();
         var orphans = FindOrphanPackages(installed, autoInstalled, removalSet);
         removalSet.UnionWith(orphans);
+        var dependents = FindBlockingDependents(installed, removalSet);
+        if (dependents.Count > 0)
+        {
+            var details = string.Join(
+                Environment.NewLine,
+                dependents.Take(20).Select(dependent => $"  {dependent}"));
+            var remaining = dependents.Count - 20;
+            if (remaining > 0)
+                details += $"{Environment.NewLine}  ... 还有 {remaining} 个软件包";
+            throw new InvalidOperationException(
+                $"无法移除 {match.Key}：仍有未计划移除的软件包依赖它：{Environment.NewLine}{details}");
+        }
 
         var changes = removalSet
             .Select(name => new PackageChange(
@@ -616,7 +628,8 @@ internal static class Program
                 continue;
 
             foreach (var dependency in ParseDependencyGroups(package.PreDepends)
-                         .Concat(ParseDependencyGroups(package.Depends)))
+                         .Concat(ParseDependencyGroups(package.Depends))
+                         .Concat(ParseDependencyGroups(package.Recommends)))
             {
                 var automaticCandidates = dependency
                     .SelectMany(alternative => GetInstalledCandidates(dependencyIndex, alternative))
@@ -647,11 +660,48 @@ internal static class Program
             }
         }
 
-        return autoInstalled
-            .Where(name => installed.ContainsKey(name) &&
+        return installed.Keys
+            .Where(name => IsAutoInstalled(name, autoInstalled) &&
                            !removed.Contains(name) &&
                            !reachable.Contains(name))
             .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static List<string> FindBlockingDependents(
+        IReadOnlyDictionary<string, InstalledPackage> installed,
+        IReadOnlySet<string> removed)
+    {
+        var dependencyIndex = BuildInstalledDependencyIndex(installed);
+        var dependents = new List<string>();
+        foreach (var entry in installed)
+        {
+            if (removed.Contains(entry.Key))
+                continue;
+
+            AddBlockingDependencies(entry.Key, entry.Value.PreDepends, "Pre-Depends");
+            AddBlockingDependencies(entry.Key, entry.Value.Depends, "Depends");
+        }
+
+        return dependents;
+
+        void AddBlockingDependencies(string packageName, string expression, string field)
+        {
+            foreach (var dependency in ParseDependencyGroups(expression))
+            {
+                var candidates = dependency
+                    .SelectMany(alternative => GetInstalledCandidates(dependencyIndex, alternative))
+                    .DistinctBy(candidate => candidate.Key)
+                    .Where(candidate => dependency.Any(alternative =>
+                        InstalledPackageSatisfies(candidate.Value, candidate.Key, alternative)))
+                    .ToList();
+                if (!candidates.Any(candidate => removed.Contains(candidate.Key)) ||
+                    candidates.Any(candidate => !removed.Contains(candidate.Key)))
+                    continue;
+
+                var alternatives = string.Join(" | ", dependency.Select(FormatDependency));
+                dependents.Add($"{packageName} ({field}: {alternatives})");
+            }
+        }
     }
 
     private static InstalledDependencyIndex BuildInstalledDependencyIndex(
@@ -1576,14 +1626,14 @@ internal static class Program
     private static async Task<Dictionary<string, InstalledPackage>> GetInstalledAsync()
     {
         var result = await RunProcessAsync("dpkg-query",
-            ["-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\\t${Provides}\\t${Pre-Depends}\\t${Depends}\\n"]);
+            ["-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\\t${Provides}\\t${Pre-Depends}\\t${Depends}\\t${Recommends}\\n"]);
         if (result.ExitCode != 0) throw new InvalidOperationException("Could not query installed packages.");
         var installed = new Dictionary<string, InstalledPackage>(StringComparer.Ordinal);
         foreach (var line in result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
         {
-            var fields = line.Split('\t', 6);
-            if (fields.Length == 6 && fields[2] == "installed")
-                installed[fields[0]] = new InstalledPackage(fields[1], fields[3], fields[4], fields[5]);
+            var fields = line.Split('\t', 7);
+            if (fields.Length == 7 && fields[2] == "installed")
+                installed[fields[0]] = new InstalledPackage(fields[1], fields[3], fields[4], fields[5], fields[6]);
         }
         return installed;
     }
@@ -1942,7 +1992,12 @@ internal static class Program
         string? LocalPath = null);
     private sealed record DependencyAlternative(string Name, string? Relation, string? Version);
     private sealed record PackageChange(string Name, string? CurrentVersion, string? TargetVersion, string? Reason = null);
-    private sealed record InstalledPackage(string Version, string Provides, string PreDepends, string Depends);
+    private sealed record InstalledPackage(
+        string Version,
+        string Provides,
+        string PreDepends,
+        string Depends,
+        string Recommends);
     private sealed record InstalledDependencyIndex(
         IReadOnlyDictionary<string, List<KeyValuePair<string, InstalledPackage>>> ByName,
         IReadOnlyDictionary<string, List<KeyValuePair<string, InstalledPackage>>> ByProvide);
