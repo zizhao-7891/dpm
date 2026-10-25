@@ -76,21 +76,21 @@ dpm clear                 # clear downloaded .deb cache (keeps indexes)
 dpm search TERM
 ```
 
-`install`, `reinstall`, and `upgrade` resolve `Pre-Depends` and `Depends`,
-including version constraints, alternative dependencies, and virtual packages
-declared by `Provides`. When a package is identified as a metapackage, its
-`Recommends` are also resolved recursively so its full package set is included.
-Already-installed satisfying packages are reused; missing dependencies are
-selected from the signed package indexes, included in the confirmation list,
-downloaded, and passed to `dpkg` together with the requested packages.
+`install`, `reinstall`, and `upgrade` resolve `Pre-Depends`, `Depends`, and
+`Recommends` recursively, including version constraints, alternative
+dependencies, and virtual packages declared by `Provides`. This follows apt's
+default of installing recommended packages; `Suggests` are not installed
+automatically. Already-installed satisfying packages are reused; missing
+dependencies are selected from the signed package indexes, included in the
+confirmation list, downloaded, and passed to `dpkg` together with the requested
+packages.
 Already-installed metapackages encountered in this dependency tree are also
 expanded, so rerunning an install can fill in missing recommended packages
 without reinstalling the metapackage itself.
 Packages are ordered so selected `Pre-Depends` are installed before their
-dependents. `Recommends` for regular packages and all `Suggests` are not
-installed automatically. Package indexes are parsed once per command, and
-dependency lookups use package-name and virtual-provider indexes to keep large
-metapackage plans responsive.
+dependents. Package indexes are parsed once per command, and dependency lookups
+use package-name and virtual-provider indexes to keep large package plans
+responsive.
 
 `install` also accepts a local `.deb` path. Its package metadata is read with
 `dpkg-deb`; the package is included in the normal confirmation and installation

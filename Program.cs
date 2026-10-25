@@ -804,11 +804,12 @@ internal static class Program
             try
             {
                 var dependencyGroups = ParseDependencyGroups(package.PreDepends)
-                    .Concat(ParseDependencyGroups(package.Depends));
-                if (package.IsMetaPackage)
-                    dependencyGroups = dependencyGroups.Concat(ParseDependencyGroups(package.Recommends));
+                    .Concat(ParseDependencyGroups(package.Depends))
+                    .Select(dependency => (Dependency: dependency, Optional: false))
+                    .Concat(ParseDependencyGroups(package.Recommends)
+                        .Select(dependency => (Dependency: dependency, Optional: true)));
 
-                foreach (var dependency in dependencyGroups)
+                foreach (var (dependency, optional) in dependencyGroups)
                 {
                     var satisfiedBySelected = dependency.Any(alternative =>
                         GetPackageCandidates(selectedByName, selectedByProvide, alternative).Any(candidate =>
@@ -844,6 +845,9 @@ internal static class Program
                     }
                     if (candidate is null)
                     {
+                        if (optional)
+                            continue;
+
                         var expression = string.Join(" | ", dependency.Select(FormatDependency));
                         throw new InvalidOperationException(
                             $"Cannot resolve dependency '{expression}' required by {package.Name} {package.Version}.");
