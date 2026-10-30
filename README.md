@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.35_arm64.deb
+sudo dpkg -i dist/dpm_0.1.36_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -73,6 +73,7 @@ dpm remove PACKAGE [PACKAGE ...]
 dpm uninstall PACKAGE [PACKAGE ...] # alias for remove
 dpm purge PACKAGE [PACKAGE ...] # removes packages and their configuration files
 dpm upgrade [PACKAGE]
+dpm upgrade-dpm           # upgrades dpm from the latest GitHub release
 dpm check                 # dpkg --audit
 dpm check-filesystem      # dpkg --verify
 dpm download PACKAGE
@@ -102,6 +103,12 @@ repositories, and include them in the normal reviewed installation plan. They
 also run `dpkg --configure --pending` when dpkg reports packages awaiting
 configuration. Unavailable or conflicting repairs are reported rather than
 bypassing dependency safety checks.
+
+`upgrade-dpm` checks the latest stable GitHub release, downloads the package
+matching the system architecture, verifies its SHA256 digest and Debian package
+metadata, then asks for confirmation before upgrading. When the effective
+`LC_ALL`, `LC_MESSAGES`, or `LANG` locale is `zh_CN.UTF-8`, the GitHub download
+URL is fetched through `https://gh-proxy.org/`.
 
 `install` also accepts a local `.deb` path. Its package metadata is read with
 `dpkg-deb`; the package is included in the normal confirmation and installation

@@ -12,6 +12,9 @@ internal static class Program
     private const string PackageDirectory = CacheDirectory + "/deb";
     private const string DpmStateDirectory = "/var/lib/dpm";
     private const string AutoInstalledFile = DpmStateDirectory + "/auto-installed";
+    private const string GitHubRepository = "zizhao-7891/dpm";
+    private const string LatestReleaseApi = "https://api.github.com/repos/" + GitHubRepository + "/releases/latest";
+    private const string GitHubProxyPrefix = "https://gh-proxy.org/";
     private static readonly HttpClient Http = new(new HttpClientHandler
     {
         AllowAutoRedirect = true
@@ -105,6 +108,10 @@ internal static class Program
                     if (args.Length > 2) throw new ArgumentException("Usage: dpm upgrade [package]");
                     await UpgradeAsync(args.Length == 2 ? args[1] : null);
                     break;
+                case "upgrade-dpm":
+                    RequireCount(args, 1);
+                    await UpgradeDpmAsync();
+                    break;
                 case "check":
                     RequireCount(args, 1);
                     await RunDpkgAsync(["--audit"]);
@@ -156,6 +163,7 @@ internal static class Program
               dpm uninstall PACKAGE [PACKAGE ...] (alias for remove)
               dpm purge PACKAGE [PACKAGE ...] (remove packages and their configuration files)
               dpm upgrade [PACKAGE]
+              dpm upgrade-dpm           (upgrade dpm from the latest GitHub release)
               dpm check                 (dpkg consistency audit)
               dpm check-filesystem      (verify installed package files)
               dpm download PACKAGE
@@ -696,6 +704,131 @@ internal static class Program
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
         WriteDpmAutoInstalled(autoInstalled);
+    }
+
+    private static async Task UpgradeDpmAsync()
+    {
+        var installed = await GetInstalledAsync();
+        if (!installed.TryGetValue("dpm", out var current))
+            throw new InvalidOperationException("The dpm package is not registered as installed.");
+
+        using var releaseResponse = await Http.GetAsync(LatestReleaseApi);
+        if (!releaseResponse.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"Could not query the latest dpm release: HTTP {(int)releaseResponse.StatusCode} {releaseResponse.ReasonPhrase}.");
+        await using var releaseStream = await releaseResponse.Content.ReadAsStreamAsync();
+        using var release = await JsonDocument.ParseAsync(releaseStream);
+
+        var releaseRoot = release.RootElement;
+        if (!releaseRoot.TryGetProperty("tag_name", out var tagElement) ||
+            tagElement.ValueKind != JsonValueKind.String)
+            throw new InvalidDataException("The latest GitHub release has no tag name.");
+        var tag = tagElement.GetString()!;
+        if (!tag.StartsWith('v') || tag.Length == 1)
+            throw new InvalidDataException($"Invalid dpm release tag '{tag}'.");
+        var targetVersion = tag[1..];
+        if (!IsVersionGreater(targetVersion, current.Version))
+        {
+            Console.WriteLine($"dpm 已是最新版本（{current.Version}）。");
+            return;
+        }
+
+        var architecture = await GetArchitectureAsync();
+        var assetName = $"dpm_{targetVersion}_{architecture}.deb";
+        if (!releaseRoot.TryGetProperty("assets", out var assets) ||
+            assets.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("The latest GitHub release has no package assets.");
+
+        JsonElement selectedAsset = default;
+        foreach (var asset in assets.EnumerateArray())
+        {
+            if (asset.TryGetProperty("name", out var nameElement) &&
+                nameElement.ValueKind == JsonValueKind.String &&
+                nameElement.GetString() == assetName)
+            {
+                selectedAsset = asset;
+                break;
+            }
+        }
+
+        if (selectedAsset.ValueKind == JsonValueKind.Undefined)
+            throw new InvalidDataException(
+                $"The latest dpm release does not provide a package for {architecture} ({assetName}).");
+        if (!selectedAsset.TryGetProperty("browser_download_url", out var urlElement) ||
+            urlElement.ValueKind != JsonValueKind.String ||
+            !Uri.TryCreate(urlElement.GetString(), UriKind.Absolute, out var downloadUri) ||
+            downloadUri.Scheme != Uri.UriSchemeHttps ||
+            downloadUri.Host != "github.com" ||
+            !downloadUri.AbsolutePath.StartsWith(
+                $"/{GitHubRepository}/releases/download/", StringComparison.Ordinal))
+            throw new InvalidDataException("The latest dpm release contains an unexpected package URL.");
+        if (!selectedAsset.TryGetProperty("digest", out var digestElement) ||
+            digestElement.ValueKind != JsonValueKind.String ||
+            !digestElement.GetString()!.StartsWith("sha256:", StringComparison.Ordinal))
+            throw new InvalidDataException("The latest dpm package does not provide a SHA256 digest.");
+
+        var expectedHash = digestElement.GetString()!["sha256:".Length..];
+        if (expectedHash.Length != 64 || expectedHash.Any(character => !Uri.IsHexDigit(character)))
+            throw new InvalidDataException("The latest dpm package has an invalid SHA256 digest.");
+
+        var currentLocale = new[]
+            {
+                Environment.GetEnvironmentVariable("LC_ALL"),
+                Environment.GetEnvironmentVariable("LC_MESSAGES"),
+                Environment.GetEnvironmentVariable("LANG")
+            }
+            .FirstOrDefault(locale => !string.IsNullOrWhiteSpace(locale));
+        if (IsChineseUtf8Locale(currentLocale))
+            downloadUri = new Uri(GitHubProxyPrefix + downloadUri.AbsoluteUri);
+
+        var temporaryPackage = Path.Combine(
+            PackageDirectory, $"dpm-upgrade-{Guid.NewGuid():N}.deb");
+        try
+        {
+            Console.WriteLine($"正在下载 dpm {targetVersion} ({architecture})…");
+            await DownloadToFileAsync(downloadUri, temporaryPackage);
+            if (!await HasHashAsync(temporaryPackage, expectedHash))
+                throw new InvalidDataException("Downloaded dpm package SHA256 does not match the GitHub release digest.");
+
+            var metadata = await RunProcessAsync("dpkg-deb", ["--field", temporaryPackage]);
+            if (metadata.ExitCode != 0)
+                throw new InvalidDataException(
+                    $"Could not inspect downloaded dpm package: {metadata.Error.Trim()}");
+            var fields = ParseParagraphs(metadata.Output).FirstOrDefault()
+                         ?? throw new InvalidDataException("Downloaded dpm package has no control metadata.");
+            if (!fields.TryGetValue("Package", out var packageName) ||
+                packageName != "dpm" ||
+                !fields.TryGetValue("Version", out var packageVersion) ||
+                packageVersion != targetVersion ||
+                !fields.TryGetValue("Architecture", out var packageArchitecture) ||
+                packageArchitecture != architecture)
+                throw new InvalidDataException(
+                    "Downloaded package metadata does not match the requested dpm release and system architecture.");
+
+            var changes = new[]
+            {
+                new PackageChange("dpm", current.Version, targetVersion)
+            };
+            if (!ConfirmPackageChanges("升级", changes))
+                return;
+
+            await RunDpkgAsync(["--install", temporaryPackage], 1, true);
+            Console.WriteLine($"dpm 已升级到 {targetVersion}。");
+        }
+        finally
+        {
+            if (File.Exists(temporaryPackage))
+                File.Delete(temporaryPackage);
+        }
+    }
+
+    private static bool IsChineseUtf8Locale(string? locale)
+    {
+        if (string.IsNullOrWhiteSpace(locale))
+            return false;
+        var normalized = locale.Split('@', 2)[0];
+        return normalized.Equals("zh_CN.UTF-8", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("zh_CN.utf8", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void AddNewAutomaticDependencies(
