@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.34_arm64.deb
+sudo dpkg -i dist/dpm_0.1.35_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -64,6 +64,10 @@ dpm update
 dpm up                    # alias for update
 dpm install PACKAGE [PACKAGE ...] # refreshes indexes, then installs all requested packages
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
+dpm fix                   # repairs missing dependencies and configures pending packages
+dpm -f                    # alias for fix
+dpm -fix                  # alias for fix
+dpm -f install PACKAGE... # repairs dependencies and installs requested packages
 dpm reinstall PACKAGE     # reinstalls the installed version from the repositories
 dpm remove PACKAGE [PACKAGE ...]
 dpm uninstall PACKAGE [PACKAGE ...] # alias for remove
@@ -91,6 +95,13 @@ Packages are ordered so selected `Pre-Depends` are installed before their
 dependents. Package indexes are parsed once per command, and dependency lookups
 use package-name and virtual-provider indexes to keep large package plans
 responsive.
+
+`fix`, `-f`, `-fix`, and `--fix-broken` scan installed packages for unsatisfied
+`Pre-Depends` and `Depends`, select available providers from the configured
+repositories, and include them in the normal reviewed installation plan. They
+also run `dpkg --configure --pending` when dpkg reports packages awaiting
+configuration. Unavailable or conflicting repairs are reported rather than
+bypassing dependency safety checks.
 
 `install` also accepts a local `.deb` path. Its package metadata is read with
 `dpkg-deb`; the package is included in the normal confirmation and installation

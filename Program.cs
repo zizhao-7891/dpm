@@ -32,6 +32,7 @@ internal static class Program
     {
         var assumeYes = args.Any(argument => argument is "-y" or "--yes");
         var assumeNo = args.Any(argument => argument is "-n" or "--no");
+        var fixBroken = args.Any(argument => argument is "-f" or "-fix" or "--fix-broken");
         if (assumeYes && assumeNo)
         {
             Console.Error.WriteLine("Error: -y and -n cannot be used together.");
@@ -40,7 +41,16 @@ internal static class Program
         Confirmation = assumeYes
             ? ConfirmationMode.Yes
             : assumeNo ? ConfirmationMode.No : ConfirmationMode.Prompt;
-        args = args.Where(argument => argument is not ("-y" or "--yes" or "-n" or "--no")).ToArray();
+        args = args.Where(argument =>
+            argument is not ("-y" or "--yes" or "-n" or "--no" or "-f" or "-fix" or "--fix-broken"))
+            .ToArray();
+        if (fixBroken && args.Length == 0)
+            args = ["fix"];
+        if (fixBroken && args[0] is not ("install" or "fix" or "fix-broken"))
+        {
+            Console.Error.WriteLine("Error: -f/--fix-broken can only be used with install or fix.");
+            return 2;
+        }
 
         if (GetEffectiveUid() != 0)
         {
@@ -66,9 +76,16 @@ internal static class Program
                     await UpdateAsync();
                     break;
                 case "install":
-                    if (args.Length < 2) throw new ArgumentException("Usage: dpm install PACKAGE [PACKAGE ...]");
+                    if (args.Length < 2 && !fixBroken)
+                        throw new ArgumentException("Usage: dpm install PACKAGE [PACKAGE ...]");
                     await UpdateAsync();
-                    await InstallAsync(args[1..]);
+                    await InstallAsync(args[1..], fixBroken);
+                    break;
+                case "fix":
+                case "fix-broken":
+                    if (args.Length > 1) throw new ArgumentException("Usage: dpm fix");
+                    await UpdateAsync();
+                    await InstallAsync([], true);
                     break;
                 case "reinstall":
                     RequireCount(args, 2);
@@ -131,6 +148,9 @@ internal static class Program
               dpm update
               dpm up                    (alias for update)
               dpm install PACKAGE|FILE.deb [PACKAGE|FILE.deb ...] (updates indexes before installing)
+              dpm fix                   (repair missing dependencies and configure pending packages)
+              dpm -f | -fix             (alias for fix)
+              dpm -f install PACKAGE... (repair existing dependencies and install packages)
               dpm reinstall PACKAGE    (reinstalls the installed package version)
               dpm remove PACKAGE [PACKAGE ...]
               dpm uninstall PACKAGE [PACKAGE ...] (alias for remove)
@@ -144,6 +164,7 @@ internal static class Program
             Options:
               -y, --yes                 automatically confirm package/cache changes
               -n, --no                  automatically cancel package/cache changes
+              -f, -fix, --fix-broken    repair broken dependencies
             """);
     }
 
@@ -376,38 +397,145 @@ internal static class Program
         return result;
     }
 
-    private static async Task InstallAsync(IReadOnlyList<string> packageArguments)
+    private static async Task InstallAsync(
+        IReadOnlyList<string> packageArguments,
+        bool fixBroken = false)
     {
-        var roots = new List<PackageRecord>(packageArguments.Count);
+        var requestedRoots = new List<PackageRecord>(packageArguments.Count);
         foreach (var packageArgument in packageArguments)
         {
             var root = await LoadLocalPackageAsync(packageArgument) ?? SelectCandidate(packageArgument);
             if (root is null)
                 throw new InvalidOperationException(
                     $"Package '{packageArgument}' was not found in the package indexes.");
-            roots.Add(root);
+            requestedRoots.Add(root);
         }
 
-        var conflictingRoots = roots
+        var conflictingRoots = requestedRoots
             .GroupBy(root => root.Name, StringComparer.Ordinal)
             .FirstOrDefault(group => group.Select(root => root.Version).Distinct(StringComparer.Ordinal).Skip(1).Any());
         if (conflictingRoots is not null)
             throw new InvalidOperationException(
                 $"Multiple requested versions of package '{conflictingRoots.Key}' cannot be installed in one transaction.");
-        roots = roots.DistinctBy(root => root.Name, StringComparer.Ordinal).ToList();
+        requestedRoots = requestedRoots.DistinctBy(root => root.Name, StringComparer.Ordinal).ToList();
 
         var installed = await GetInstalledAsync();
+        var repairRoots = fixBroken ? FindBrokenDependencyRoots(installed) : [];
+        var pendingConfiguration = fixBroken ? await GetPendingConfigurationAsync() : "";
+        var roots = requestedRoots.Concat(repairRoots)
+            .GroupBy(root => root.Name, StringComparer.Ordinal)
+            .Select(group =>
+            {
+                if (group.Select(root => root.Version).Distinct(StringComparer.Ordinal).Skip(1).Any())
+                    throw new InvalidOperationException(
+                        $"Conflicting versions of package '{group.Key}' prevent automatic repair.");
+                return group.First();
+            })
+            .ToList();
+
+        if (roots.Count == 0 && string.IsNullOrWhiteSpace(pendingConfiguration))
+        {
+            Console.WriteLine(fixBroken ? "没有发现需要修复的软件包。" : "没有需要安装的软件包。");
+            return;
+        }
+
         var plan = ResolveDependencies(roots, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
+        if (!string.IsNullOrWhiteSpace(pendingConfiguration))
+            Console.WriteLine("dpkg 检测到尚未配置的软件包；安装依赖后将尝试配置待处理的软件包。");
         if (!ConfirmPackageChanges("安装", changes))
             return;
-        var files = await DownloadPackagesAsync(orderedPlan);
-        await InstallPackagesAsync(files, orderedPlan);
+
+        if (orderedPlan.Count > 0)
+        {
+            var files = await DownloadPackagesAsync(orderedPlan);
+            await InstallPackagesAsync(files, orderedPlan);
+        }
+        if (!string.IsNullOrWhiteSpace(pendingConfiguration))
+            await RunDpkgAsync(["--configure", "--pending"]);
+
         var autoInstalled = ReadDpmAutoInstalled();
-        autoInstalled.RemoveWhere(name => roots.Any(root => PackageNameMatches(name, root.Name)));
-        AddNewAutomaticDependencies(autoInstalled, plan, installed, roots.Select(root => root.Name));
+        autoInstalled.RemoveWhere(name =>
+            requestedRoots.Any(root => PackageNameMatches(name, root.Name)));
+        AddNewAutomaticDependencies(
+            autoInstalled, plan, installed, requestedRoots.Select(root => root.Name));
         WriteDpmAutoInstalled(autoInstalled);
+    }
+
+    private static List<PackageRecord> FindBrokenDependencyRoots(
+        IReadOnlyDictionary<string, InstalledPackage> installed)
+    {
+        var packages = LoadPackages();
+        var installedIndex = BuildInstalledDependencyIndex(installed);
+        var roots = new Dictionary<string, PackageRecord>(StringComparer.Ordinal);
+        var unresolved = new List<string>();
+
+        foreach (var entry in installed)
+        foreach (var dependency in ParseDependencyGroups(entry.Value.PreDepends)
+                     .Concat(ParseDependencyGroups(entry.Value.Depends)))
+        {
+            if (dependency.Any(alternative =>
+                    GetInstalledCandidates(installedIndex, alternative).Any(candidate =>
+                        InstalledPackageSatisfies(candidate.Value, candidate.Key, alternative))))
+                continue;
+
+            var candidate = SelectDependencyCandidate(packages, dependency);
+            if (candidate is null)
+            {
+                var expression = string.Join(" | ", dependency.Select(FormatDependency));
+                unresolved.Add($"{entry.Key}: {expression}");
+                continue;
+            }
+
+            if (roots.TryGetValue(candidate.Name, out var existing) &&
+                !string.Equals(existing.Version, candidate.Version, StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    $"Conflicting versions of {candidate.Name} are needed to repair installed dependencies.");
+            roots[candidate.Name] = candidate;
+        }
+
+        if (unresolved.Count > 0)
+        {
+            var details = string.Join(
+                Environment.NewLine,
+                unresolved.Take(20).Select(dependency => $"  {dependency}"));
+            if (unresolved.Count > 20)
+                details += $"{Environment.NewLine}  ... 还有 {unresolved.Count - 20} 项";
+            throw new InvalidOperationException(
+                $"已配置的软件源无法满足以下依赖：{Environment.NewLine}{details}");
+        }
+
+        return roots.Values.ToList();
+    }
+
+    private static PackageRecord? SelectDependencyCandidate(
+        IReadOnlyList<PackageRecord> packages,
+        IReadOnlyList<DependencyAlternative> dependency)
+    {
+        foreach (var alternative in dependency)
+        {
+            var candidate = packages
+                .Where(package => PackageSatisfies(package, alternative))
+                .Aggregate<PackageRecord, PackageRecord?>(
+                    null,
+                    (best, current) =>
+                        best is null || CompareVersions(current.Version, best.Version) > 0
+                            ? current
+                            : best);
+            if (candidate is not null)
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private static async Task<string> GetPendingConfigurationAsync()
+    {
+        var result = await RunProcessAsync("dpkg", ["--audit"]);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"Could not audit dpkg state: {result.Error.Trim()}");
+        return result.Output.Trim();
     }
 
     private static async Task<PackageRecord?> LoadLocalPackageAsync(string packageArgument)
