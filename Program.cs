@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32.SafeHandles;
 
 internal static class Program
 {
@@ -12,6 +14,9 @@ internal static class Program
     private const string PackageDirectory = CacheDirectory + "/deb";
     private const string DpmStateDirectory = "/var/lib/dpm";
     private const string AutoInstalledFile = DpmStateDirectory + "/auto-installed";
+    private const string DpmLockFile = "/run/lock/dpm.lock";
+    private const int LockExclusive = 2;
+    private const int LockNonBlocking = 4;
     private const string GitHubRepository = "zizhao-7891/dpm";
     private const string LatestReleaseApi = "https://api.github.com/repos/" + GitHubRepository + "/releases/latest";
     private const string GitHubProxyPrefix = "https://gh-proxy.org/";
@@ -69,6 +74,7 @@ internal static class Program
 
         try
         {
+            using var operationLock = AcquireDpmLock();
             Directory.CreateDirectory(IndexDirectory);
             Directory.CreateDirectory(PackageDirectory);
             switch (args[0])
@@ -145,6 +151,27 @@ internal static class Program
             return 1;
         }
     }
+
+    private static FileStream AcquireDpmLock()
+    {
+        var stream = new FileStream(
+            DpmLockFile,
+            FileMode.OpenOrCreate,
+            FileAccess.ReadWrite,
+            FileShare.ReadWrite);
+        if (flock(stream.SafeFileHandle, LockExclusive | LockNonBlocking) == 0)
+            return stream;
+
+        var error = Marshal.GetLastPInvokeError();
+        stream.Dispose();
+        if (error is 11 or 35)
+            throw new InvalidOperationException(
+                "Another dpm process is already running. Wait for it to finish before starting another operation.");
+        throw new IOException($"Could not acquire dpm lock file '{DpmLockFile}' (errno {error}).");
+    }
+
+    [DllImport("libc", EntryPoint = "flock", SetLastError = true)]
+    private static extern int flock(SafeFileHandle fileDescriptor, int operation);
 
     private static void PrintUsage()
     {

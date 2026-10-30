@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.36_arm64.deb
+sudo dpkg -i dist/dpm_0.1.37_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -29,6 +29,9 @@ as the dpkg-managed conffile `/etc/dpm/sources.list.d/tuna.list`. At runtime,
 `dpkg`, `gpgv`, `xz-utils`, and `gzip` are Debian package dependencies. Every
 invocation requires effective UID 0. `dpm` never invokes `sudo`, `su`, `pkexec`,
 or PolicyKit and does not attempt to elevate privileges.
+Operational commands take an exclusive `/run/lock/dpm.lock` lock so concurrent
+dpm processes cannot race on package indexes, caches, or dpkg operations. The
+kernel releases the lock automatically when the process exits.
 
 ## Sources
 
