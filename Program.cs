@@ -333,7 +333,9 @@ internal static class Program
                     var declaredComponents = releaseComponents.Split(
                         (char[]?)null, StringSplitOptions.RemoveEmptyEntries);
                     var missingComponents = source.Components
-                        .Where(component => !declaredComponents.Contains(component, StringComparer.Ordinal))
+                        .Where(component =>
+                            !declaredComponents.Contains(component, StringComparer.Ordinal) &&
+                            !declaredComponents.Contains("updates/" + component, StringComparer.Ordinal))
                         .ToArray();
                     if (missingComponents.Length > 0)
                         throw new InvalidDataException(
