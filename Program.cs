@@ -834,7 +834,11 @@ internal static class Program
             return;
 
         var dpkgAction = purge ? "--purge" : "--remove";
-        await RunDpkgAsync([dpkgAction, "--", .. removalSet.Order(StringComparer.Ordinal)], removalSet.Count, true);
+        await RunDpkgAsync(
+            [dpkgAction, "--", .. removalSet.Order(StringComparer.Ordinal)],
+            removalSet.Count,
+            true,
+            removalSet);
         var dpmAutoInstalled = ReadDpmAutoInstalled();
         dpmAutoInstalled.ExceptWith(removalSet);
         WriteDpmAutoInstalled(dpmAutoInstalled);
@@ -981,7 +985,11 @@ internal static class Program
             if (!ConfirmPackageChanges("升级", changes))
                 return;
 
-            await RunDpkgAsync(["--install", temporaryPackage], 1, true);
+            await RunDpkgAsync(
+                ["--install", temporaryPackage],
+                1,
+                true,
+                new HashSet<string>(["dpm"], StringComparer.Ordinal));
             Console.WriteLine($"dpm 已升级到 {targetVersion}。");
         }
         finally
@@ -1021,7 +1029,11 @@ internal static class Program
     {
         try
         {
-            await RunDpkgAsync(["--install", .. files], files.Count, true);
+            await RunDpkgAsync(
+                ["--install", .. files],
+                files.Count,
+                true,
+                packages.Select(package => package.Name).ToHashSet(StringComparer.Ordinal));
         }
         catch (InvalidOperationException installError)
         {
@@ -2094,7 +2106,8 @@ internal static class Program
     private static async Task RunDpkgAsync(
         IReadOnlyList<string> arguments,
         int expectedPackageCount = 0,
-        bool showProgress = false)
+        bool showProgress = false,
+        IReadOnlySet<string>? progressPackages = null)
     {
         var start = new ProcessStartInfo("dpkg")
         {
@@ -2108,7 +2121,7 @@ internal static class Program
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start dpkg.");
         var outputTask = showProgress ? process.StandardOutput.ReadToEndAsync() : null;
         var errorOutput = showProgress
-            ? await ReadDpkgProgressAsync(process, expectedPackageCount)
+            ? await ReadDpkgProgressAsync(process, expectedPackageCount, progressPackages)
             : "";
         await process.WaitForExitAsync();
         if (outputTask is not null)
@@ -2128,11 +2141,13 @@ internal static class Program
         }
     }
 
-    private static async Task<string> ReadDpkgProgressAsync(Process process, int totalPackages)
+    private static async Task<string> ReadDpkgProgressAsync(
+        Process process,
+        int totalPackages,
+        IReadOnlySet<string>? progressPackages)
     {
         var completed = new HashSet<string>(StringComparer.Ordinal);
         var diagnostics = new StringBuilder();
-        var removing = false;
         string? currentPackage = null;
         string? currentStage = null;
 
@@ -2146,12 +2161,11 @@ internal static class Program
 
                 currentStage = fields[0].Trim();
                 currentPackage = fields[1].Trim();
-                if (currentStage is "trigproc" or "configure" or "unpack")
+                if (currentStage is not ("install" or "configure" or "remove" or "purge") ||
+                    !IsExpectedProgressPackage(currentPackage))
                     continue;
 
-                removing = currentStage is "remove" or "purge";
-                if (currentStage is "install" or "remove" or "purge")
-                    RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
+                RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
             }
             else if (line.StartsWith("status: ", StringComparison.Ordinal))
             {
@@ -2160,10 +2174,18 @@ internal static class Program
                 {
                     var package = fields[0].Trim();
                     var status = fields[1].Trim();
-                    if ((!removing && status == "installed") ||
-                        (removing && status is "config-files" or "not-installed"))
+                    var isCurrentPackage = string.Equals(package, currentPackage, StringComparison.Ordinal);
+                    var isExpectedPackage = IsExpectedProgressPackage(package);
+                    var isCompleted = currentStage switch
                     {
-                        completed.Add(package);
+                        "install" or "configure" => status == "installed",
+                        "remove" => status is "config-files" or "not-installed",
+                        "purge" => status == "not-installed",
+                        _ => false
+                    };
+                    if (isCurrentPackage && isExpectedPackage && isCompleted &&
+                        completed.Add(package))
+                    {
                         currentPackage = package;
                         RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
                     }
@@ -2175,6 +2197,11 @@ internal static class Program
             }
         }
         return diagnostics.ToString();
+
+        bool IsExpectedProgressPackage(string package) =>
+            progressPackages is null ||
+            progressPackages.Any(expected =>
+                PackageNameMatches(package, expected) || PackageNameMatches(expected, package));
     }
 
     private static void RenderDpkgProgress(
@@ -2186,13 +2213,24 @@ internal static class Program
     {
         if (total <= 0) return;
         var percent = forceComplete ? 100 : Math.Clamp(completed * 100 / total, 0, 99);
-        var width = 20;
+        const int width = 16;
         var filled = percent * width / 100;
         var bar = new string('#', filled) + new string('-', width - filled);
-        var detail = string.Join(' ', new[] { package, stage }.Where(value => !string.IsNullOrWhiteSpace(value)));
-        var message = $"正在运行 [{bar}] {percent,3}% ({completed}/{total} 个软件包完成) {detail}";
+        var action = stage switch
+        {
+            "install" or "configure" => "安装",
+            "remove" => "卸载",
+            "purge" => "清除",
+            "完成" => "完成",
+            _ => "处理"
+        };
+        var detail = string.IsNullOrWhiteSpace(package) ? "" : $" {package}";
+        var message = $"{action} [{bar}] {percent,3}% {completed}/{total}{detail}";
         if (Console.IsOutputRedirected)
-            Console.WriteLine(message);
+        {
+            if (forceComplete)
+                Console.WriteLine($"完成 ({total}/{total})");
+        }
         else
             Console.Write($"\r{message}\u001b[K");
 
