@@ -2141,13 +2141,17 @@ internal static class Program
             if (line.StartsWith("processing: ", StringComparison.Ordinal))
             {
                 var fields = line["processing: ".Length..].Split(':', 2);
-                if (fields.Length == 2)
-                {
-                    currentStage = fields[0].Trim();
-                    currentPackage = fields[1].Trim();
-                    removing = currentStage is "remove" or "purge";
+                if (fields.Length != 2)
+                    continue;
+
+                currentStage = fields[0].Trim();
+                currentPackage = fields[1].Trim();
+                if (currentStage is "trigproc" or "configure" or "unpack")
+                    continue;
+
+                removing = currentStage is "remove" or "purge";
+                if (currentStage is "install" or "remove" or "purge")
                     RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
-                }
             }
             else if (line.StartsWith("status: ", StringComparison.Ordinal))
             {
