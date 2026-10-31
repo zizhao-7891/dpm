@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-VERSION=${VERSION:-0.1.37}
+VERSION=${VERSION:-0.1.38}
 ARCH=${ARCH:-arm64}
 OUTPUT="$ROOT/dist"
 STAGE="$ROOT/.package-root"
@@ -43,12 +43,7 @@ mkdir -p "$OUTPUT" "$STAGE/DEBIAN" "$STAGE/etc/dpm/sources.list.d" "$STAGE/usr/b
 install -m 0755 "$PUBLISH/dpm" "$STAGE/usr/bin/dpm"
 install -m 0644 "$ROOT/README.md" "$STAGE/usr/share/doc/dpm/README.md"
 install -m 0644 "$ROOT/tuna.list" "$STAGE/usr/share/doc/dpm/examples/tuna.list"
-install -m 0644 "$ROOT/tuna.list" "$STAGE/etc/dpm/sources.list.d/tuna.list"
 find "$STAGE" -type d -exec chmod 0755 {} +
-
-cat > "$STAGE/DEBIAN/conffiles" <<EOF
-/etc/dpm/sources.list.d/tuna.list
-EOF
 
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: dpm

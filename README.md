@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.37_arm64.deb
+sudo dpkg -i dist/dpm_0.1.38_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -24,8 +24,10 @@ ARCH=amd64 VERSION=0.2.0 ./build-deb.sh
 ARCH=armhf VERSION=0.2.0 ./build-deb.sh
 ```
 
-The package includes the .NET runtime and installs the Tsinghua mirror source
-as the dpkg-managed conffile `/etc/dpm/sources.list.d/tuna.list`. At runtime,
+The package includes the .NET runtime and an optional Tsinghua mirror example
+at `/usr/share/doc/dpm/examples/tuna.list`; it does not enable any repository
+source by default. Configure your own `.list` file in
+`/etc/dpm/sources.list.d/` before running repository operations. At runtime,
 `dpkg`, `gpgv`, `xz-utils`, and `gzip` are Debian package dependencies. Every
 invocation requires effective UID 0. `dpm` never invokes `sudo`, `su`, `pkexec`,
 or PolicyKit and does not attempt to elevate privileges.
@@ -35,9 +37,11 @@ kernel releases the lock automatically when the process exits.
 
 ## Sources
 
-`dpm` reads standard Debian `.list` files from `/etc/dpm/sources.list.d/`.
-The included `tuna.list` uses the same `deb URI suite component...` format as
-APT:
+`dpm` reads standard Debian `.list` files from `/etc/dpm/sources.list.d/` and
+does not select a mirror on your behalf. The optional Tsinghua example is
+available at `/usr/share/doc/dpm/examples/tuna.list`; copy and edit it to
+configure that mirror, or create a file with your preferred mirror. Repository
+files use the same `deb URI suite component...` format as APT:
 
 ```text
 deb https://mirrors.tuna.tsinghua.edu.cn/debian/ trixie main contrib non-free non-free-firmware
