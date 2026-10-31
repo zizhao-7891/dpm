@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.42_arm64.deb
+sudo dpkg -i dist/dpm_0.1.43_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -117,11 +117,14 @@ also run `dpkg --configure --pending` when dpkg reports packages awaiting
 configuration. Unavailable or conflicting repairs are reported rather than
 bypassing dependency safety checks.
 
-`upgrade-dpm` checks the latest stable GitHub release, downloads the package
-matching the system architecture, verifies its SHA256 digest and Debian package
-metadata, then asks for confirmation before upgrading. When the effective
-`LC_ALL`, `LC_MESSAGES`, or `LANG` locale is `zh_CN.UTF-8`, the GitHub download
-URL is fetched through `https://gh-proxy.org/`.
+`upgrade-dpm` compares the installed version with the latest stable GitHub
+release and exits only when they match. Otherwise, GitHub's release is treated
+as authoritative: dpm displays the publisher and release notes and asks before
+downloading. After confirmation it verifies the package SHA256 digest and
+Debian metadata, then installs it with dpkg. If the installed version is newer,
+dpkg is explicitly allowed to downgrade to the GitHub release. When the
+effective `LC_ALL`, `LC_MESSAGES`, or `LANG` locale is `zh_CN.UTF-8`, the GitHub
+download URL is fetched through `https://gh-proxy.org/`.
 
 `install` also accepts a local `.deb` path. Its package metadata is read with
 `dpkg-deb`; the package is included in the normal confirmation and installation

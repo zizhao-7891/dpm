@@ -958,7 +958,8 @@ internal static class Program
         if (!tag.StartsWith('v') || tag.Length == 1)
             throw new InvalidDataException($"Invalid dpm release tag '{tag}'.");
         var targetVersion = tag[1..];
-        if (!IsVersionGreater(targetVersion, current.Version))
+        var versionComparison = CompareVersions(targetVersion, current.Version);
+        if (versionComparison == 0)
         {
             Console.WriteLine($"dpm 已是最新版本（{current.Version}）。");
             return;
@@ -1002,6 +1003,30 @@ internal static class Program
         if (expectedHash.Length != 64 || expectedHash.Any(character => !Uri.IsHexDigit(character)))
             throw new InvalidDataException("The latest dpm package has an invalid SHA256 digest.");
 
+        var publisher = releaseRoot.TryGetProperty("author", out var authorElement) &&
+                        authorElement.ValueKind == JsonValueKind.Object &&
+                        authorElement.TryGetProperty("login", out var loginElement) &&
+                        loginElement.ValueKind == JsonValueKind.String
+            ? loginElement.GetString()
+            : null;
+        var releaseNotes = releaseRoot.TryGetProperty("body", out var bodyElement) &&
+                           bodyElement.ValueKind == JsonValueKind.String
+            ? bodyElement.GetString()?.Trim()
+            : null;
+        Console.WriteLine($"GitHub Release: dpm {targetVersion} ({architecture})");
+        Console.WriteLine($"本地版本: {current.Version}");
+        Console.WriteLine($"维护者: {publisher ?? "未知"}");
+        Console.WriteLine("更新日志:");
+        Console.WriteLine(string.IsNullOrWhiteSpace(releaseNotes) ? "（无）" : releaseNotes);
+        if (versionComparison < 0)
+            Console.WriteLine("注意：本地版本高于 GitHub Release，将按 GitHub Release 版本回退。");
+        var changes = new[]
+        {
+            new PackageChange("dpm", current.Version, targetVersion)
+        };
+        if (!ConfirmPackageChanges("升级", changes))
+            return;
+
         var currentLocale = new[]
             {
                 Environment.GetEnvironmentVariable("LC_ALL"),
@@ -1036,15 +1061,13 @@ internal static class Program
                 throw new InvalidDataException(
                     "Downloaded package metadata does not match the requested dpm release and system architecture.");
 
-            var changes = new[]
-            {
-                new PackageChange("dpm", current.Version, targetVersion)
-            };
-            if (!ConfirmPackageChanges("升级", changes))
-                return;
-
+            var dpkgArguments = new List<string>();
+            if (versionComparison < 0)
+                dpkgArguments.Add("--force-downgrade");
+            dpkgArguments.Add("--install");
+            dpkgArguments.Add(temporaryPackage);
             await RunDpkgAsync(
-                ["--install", temporaryPackage],
+                dpkgArguments,
                 1,
                 true,
                 new HashSet<string>(["dpm"], StringComparer.Ordinal));
