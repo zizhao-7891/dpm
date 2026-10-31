@@ -866,7 +866,52 @@ internal static class Program
             return;
         }
 
-        var plan = ResolveDependencies(candidates.Select(item => item.Candidate).ToList(), installed);
+        var upgradeCandidates = candidates
+            .Select(item => item.Candidate)
+            .OrderBy(package => package.Name, StringComparer.Ordinal)
+            .ToArray();
+        var heldBack = new List<(PackageRecord Package, string Reason)>();
+        Dictionary<string, PackageRecord> plan;
+        try
+        {
+            plan = ResolveDependencies(upgradeCandidates, installed);
+        }
+        catch (InvalidOperationException)
+        {
+            var compatibleCandidates = new List<PackageRecord>();
+            AddCompatibleUpgradeBatch(upgradeCandidates);
+            if (compatibleCandidates.Count == 0)
+            {
+                Console.WriteLine("升级候选存在依赖冲突，没有可安全升级的软件包。");
+                PrintHeldBackUpgrades(heldBack);
+                return;
+            }
+
+            plan = ResolveDependencies(compatibleCandidates, installed);
+            PrintHeldBackUpgrades(heldBack);
+
+            void AddCompatibleUpgradeBatch(PackageRecord[] batch)
+            {
+                try
+                {
+                    ResolveDependencies(compatibleCandidates.Concat(batch).ToList(), installed);
+                    compatibleCandidates.AddRange(batch);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    if (batch.Length == 1)
+                    {
+                        heldBack.Add((batch[0], ex.Message));
+                        return;
+                    }
+
+                    var midpoint = batch.Length / 2;
+                    AddCompatibleUpgradeBatch(batch[..midpoint]);
+                    AddCompatibleUpgradeBatch(batch[midpoint..]);
+                }
+            }
+        }
+
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("升级", changes))
@@ -877,6 +922,19 @@ internal static class Program
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
         WriteDpmAutoInstalled(autoInstalled);
+    }
+
+    private static void PrintHeldBackUpgrades(
+        IReadOnlyList<(PackageRecord Package, string Reason)> heldBack)
+    {
+        if (heldBack.Count == 0)
+            return;
+
+        Console.WriteLine($"因依赖冲突暂缓升级 {heldBack.Count} 个软件包：");
+        foreach (var (package, reason) in heldBack.Take(20))
+            Console.WriteLine($"  {package.Name} {package.Version}: {reason}");
+        if (heldBack.Count > 20)
+            Console.WriteLine($"  ……另有 {heldBack.Count - 20} 个软件包");
     }
 
     private static async Task UpgradeDpmAsync()

@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.41_arm64.deb
+sudo dpkg -i dist/dpm_0.1.42_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -131,6 +131,12 @@ The local package architecture must match the system or be `all`.
 `reinstall` requires the package to be installed and its exact installed version
 to be available in the configured repositories. It reinstalls that version
 rather than silently upgrading it.
+
+For a full `upgrade`, dpm first tries to plan every available package update
+together. If the combined plan has dependency conflicts, it retries in smaller
+batches and holds back only candidates that still cannot be resolved alongside
+the compatible updates. Held-back packages and the dependency error are shown
+before confirmation.
 
 When removing or purging a package, `dpm` also detects unreachable automatic
 packages and offers to remove them in the same transaction. Only dependencies
