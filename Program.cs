@@ -84,6 +84,10 @@ internal static class Program
                     RequireCount(args, 1);
                     await UpdateAsync();
                     break;
+                case "check-sources":
+                    RequireCount(args, 1);
+                    await CheckSourcesAsync();
+                    break;
                 case "install":
                     if (args.Length < 2 && !fixBroken)
                         throw new ArgumentException("Usage: dpm install PACKAGE [PACKAGE ...]");
@@ -181,6 +185,7 @@ internal static class Program
               dpm [-y | -n] COMMAND [ARGS...]
               dpm update
               dpm up                    (alias for update)
+              dpm check-sources         (check configured source suite, architecture, and indexes)
               dpm install PACKAGE|FILE.deb [PACKAGE|FILE.deb ...] (updates indexes before installing)
               dpm fix                   (repair missing dependencies and configure pending packages)
               dpm -f | -fix             (alias for fix)
@@ -240,6 +245,143 @@ internal static class Program
         }
         if (unchanged > 0)
             Console.WriteLine($"有 {unchanged} 个本地索引与服务器一致，已跳过下载。");
+    }
+
+    private static async Task CheckSourcesAsync()
+    {
+        var sources = ReadSources();
+        if (sources.Count == 0)
+            throw new InvalidOperationException($"No deb sources found in {SourceDirectory}.");
+
+        var architecture = await GetArchitectureAsync();
+        var keyrings = GetKeyrings();
+        if (keyrings.Count == 0)
+            throw new InvalidOperationException("No APT signing keyrings found; refusing to use unsigned repository metadata.");
+
+        var applicableSources = sources
+            .Where(source => source.Architectures is null ||
+                             source.Architectures.Contains(architecture, StringComparer.Ordinal))
+            .ToList();
+        if (applicableSources.Count == 0)
+            throw new InvalidOperationException($"No configured repository supports architecture {architecture}.");
+
+        var failures = 0;
+        foreach (var source in applicableSources)
+        {
+            try
+            {
+                await ValidateSourceAsync(source, architecture, keyrings);
+                Console.WriteLine($"可用: {source.Uri} {source.Suite}");
+            }
+            catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or
+                                       InvalidOperationException or TaskCanceledException)
+            {
+                failures++;
+                Console.Error.WriteLine($"不可用: {source.Uri} {source.Suite}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine($"软件源判定完成：{applicableSources.Count - failures} 个可用，{failures} 个不可用。");
+        if (failures > 0)
+            throw new InvalidOperationException($"{failures} configured software source(s) failed validation.");
+    }
+
+    private static async Task ValidateSourceAsync(
+        RepositorySource source,
+        string architecture,
+        IReadOnlyList<string> keyrings)
+    {
+        var distUri = source.IsFlat
+            ? EnsureTrailingSlash(source.Uri)
+            : EnsureTrailingSlash(source.Uri) + "dists/" + Uri.EscapeDataString(source.Suite) + "/";
+        var temp = Path.Combine(Path.GetTempPath(), "dpm-check-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temp);
+        try
+        {
+            var releasePath = Path.Combine(temp, "Release");
+            var inReleasePath = Path.Combine(temp, "InRelease");
+            if (await TryDownloadToFileAsync(new Uri(distUri + "InRelease"), inReleasePath))
+                await VerifyInReleaseAsync(inReleasePath, releasePath, keyrings);
+            else
+            {
+                await DownloadToFileAsync(new Uri(distUri + "Release"), releasePath);
+                var signaturePath = Path.Combine(temp, "Release.gpg");
+                await DownloadToFileAsync(new Uri(distUri + "Release.gpg"), signaturePath);
+                await VerifyReleaseAsync(signaturePath, releasePath, keyrings);
+            }
+
+            var releaseText = await File.ReadAllTextAsync(releasePath);
+            var checksums = ParseSha256(releaseText);
+            if (!source.IsFlat)
+            {
+                var releaseSuite = GetReleaseField(releaseText, "Suite");
+                var codename = GetReleaseField(releaseText, "Codename");
+                if (!SuiteMatches(source.Suite, releaseSuite, codename))
+                    throw new InvalidDataException(
+                        $"configured suite '{source.Suite}' does not match signed Release Suite '{releaseSuite ?? "(missing)"}' or Codename '{codename ?? "(missing)"}'.");
+
+                var releaseArchitectures = GetReleaseField(releaseText, "Architectures");
+                if (releaseArchitectures is not null &&
+                    !releaseArchitectures.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                        .Contains(architecture, StringComparer.Ordinal))
+                    throw new InvalidDataException(
+                        $"signed Release metadata does not support architecture {architecture}.");
+
+                var releaseComponents = GetReleaseField(releaseText, "Components");
+                if (releaseComponents is not null)
+                {
+                    var declaredComponents = releaseComponents.Split(
+                        (char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                    var missingComponents = source.Components
+                        .Where(component => !declaredComponents.Contains(component, StringComparer.Ordinal))
+                        .ToArray();
+                    if (missingComponents.Length > 0)
+                        throw new InvalidDataException(
+                            $"signed Release metadata does not provide configured component(s): {string.Join(", ", missingComponents)}.");
+                }
+            }
+
+            foreach (var component in source.IsFlat ? new string?[] { null } : source.Components.Select(value => (string?)value))
+            {
+                var indexPaths = source.IsFlat
+                    ? new[] { "Packages.xz", "Packages.gz", "Packages" }
+                    : new[]
+                    {
+                        $"{component}/binary-{architecture}/Packages.xz",
+                        $"{component}/binary-{architecture}/Packages.gz",
+                        $"{component}/binary-{architecture}/Packages"
+                    };
+                if (!indexPaths.Any(checksums.ContainsKey))
+                    throw new InvalidDataException(source.IsFlat
+                        ? $"signed Release metadata has no flat package index for {source.Uri}."
+                        : $"signed Release metadata has no package index for {component}/{architecture}.");
+            }
+        }
+        finally
+        {
+            Directory.Delete(temp, true);
+        }
+    }
+
+    private static string? GetReleaseField(string release, string field)
+    {
+        var prefix = field + ":";
+        foreach (var line in release.Split('\n'))
+        {
+            var normalized = line.TrimEnd('\r');
+            if (normalized.StartsWith(prefix, StringComparison.Ordinal))
+                return normalized[prefix.Length..].Trim();
+        }
+        return null;
+    }
+
+    private static bool SuiteMatches(string configuredSuite, string? releaseSuite, string? codename)
+    {
+        if (configuredSuite.Equals(releaseSuite, StringComparison.Ordinal) ||
+            configuredSuite.Equals(codename, StringComparison.Ordinal))
+            return true;
+        return codename is not null &&
+               configuredSuite.StartsWith(codename + "-", StringComparison.Ordinal);
     }
 
     private static void RenderIndexProgress(int completedIndexes, int totalIndexes)

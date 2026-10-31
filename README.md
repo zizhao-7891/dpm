@@ -13,7 +13,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.38_arm64.deb
+sudo dpkg -i dist/dpm_0.1.39_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -60,6 +60,11 @@ Both clear-signed `InRelease` and detached `Release.gpg` metadata are verified;
 unsigned repositories are rejected. `.sources` files and `deb-src` entries are
 not supported. Binary `.gpg` signing keyrings must already be available in
 `/etc/apt/trusted.gpg`, `/etc/apt/trusted.gpg.d/`, or `/usr/share/keyrings/`.
+Run `dpm check-sources` to assess configured sources before installing. It
+verifies signed Release metadata, checks the configured suite against the
+repository's Suite/Codename, and confirms the current architecture and requested
+components have signed package indexes. Flat repositories are checked for a
+signed package index.
 
 Indexes are stored in `/var/cache/dpm/list`; verified `.deb` files are stored
 in `/var/cache/dpm/deb`.
@@ -69,6 +74,7 @@ in `/var/cache/dpm/deb`.
 ```text
 dpm update
 dpm up                    # alias for update
+dpm check-sources         # checks configured sources against signed Release metadata
 dpm install PACKAGE [PACKAGE ...] # refreshes indexes, then installs all requested packages
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm fix                   # repairs missing dependencies and configures pending packages
