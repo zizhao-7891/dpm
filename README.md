@@ -16,7 +16,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.47_arm64.deb
+sudo dpkg -i dist/dpm_0.1.48_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -105,6 +105,14 @@ Package-name patterns support `*` (any sequence) and `?` (one character) in
 For example, `dpm install 'python3-*'` selects the newest indexed version of
 each matching package. Quote patterns so the shell passes them to `dpm`
 unchanged. `search` also continues to match terms in package descriptions.
+
+Before installing or upgrading, dpm resolves the complete dependency plan and
+shows it before making system changes. If the preferred plan has conflicting
+dependency choices, dpm searches for up to five compatible alternatives and
+lets you select one. `-y` selects the first valid solution and confirms the
+resulting package plan automatically. If no indexed package set can satisfy
+the dependencies, dpm makes no changes and suggests checking/enabling sources,
+choosing a compatible package version or local `.deb`, or cancelling.
 
 `install`, `reinstall`, and `upgrade` resolve `Pre-Depends`, `Depends`, and
 `Recommends` recursively, including version constraints, alternative

@@ -156,6 +156,11 @@ internal static class Program
 
             return 0;
         }
+        catch (OperationCanceledException ex)
+        {
+            Console.WriteLine(ex.Message);
+            return 0;
+        }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Error: {ex.Message}");
@@ -661,7 +666,7 @@ internal static class Program
             return;
         }
 
-        var plan = ResolveDependencies(roots, installed);
+        var plan = ResolveDependenciesForOperation(roots, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!string.IsNullOrWhiteSpace(pendingConfiguration))
@@ -850,7 +855,7 @@ internal static class Program
             roots.Add(root);
         }
 
-        var plan = ResolveDependencies(roots, installed);
+        var plan = ResolveDependenciesForOperation(roots, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("重新安装", changes))
@@ -1021,7 +1026,7 @@ internal static class Program
                 return;
             }
 
-            plan = ResolveDependencies(compatibleCandidates, installed);
+            plan = ResolveDependenciesForOperation(compatibleCandidates, installed);
             PrintHeldBackUpgrades(heldBack);
 
             void AddCompatibleUpgradeBatch(PackageRecord[] batch)
@@ -2635,9 +2640,154 @@ internal static class Program
         }
     }
 
-    private static Dictionary<string, PackageRecord> ResolveDependencies(
+    private static Dictionary<string, PackageRecord> ResolveDependenciesForOperation(
         IReadOnlyList<PackageRecord> roots,
         IReadOnlyDictionary<string, InstalledPackage> installed)
+    {
+        const int maxSolutions = 5;
+        const int maxAttempts = 64;
+        var pendingChoices = new Queue<Dictionary<string, string>>();
+        var visitedChoices = new HashSet<string>(StringComparer.Ordinal);
+        var solutions = new List<Dictionary<string, PackageRecord>>();
+        var solutionSignatures = new HashSet<string>(StringComparer.Ordinal);
+        Exception? firstFailure = null;
+        var attempts = 0;
+        var noChoices = new Dictionary<string, string>(StringComparer.Ordinal);
+        var initialDecisions = new List<DependencyDecision>();
+        try
+        {
+            return ResolveDependencies(roots, installed, noChoices, initialDecisions);
+        }
+        catch (DependencyResolutionException exception)
+        {
+            firstFailure = exception;
+            EnqueueAlternatives(initialDecisions.Append(exception.Decision), noChoices);
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw CreateDependencyFailure(exception);
+        }
+
+        while (pendingChoices.Count > 0 && attempts++ < maxAttempts && solutions.Count < maxSolutions)
+        {
+            var choices = pendingChoices.Dequeue();
+            var choiceSignature = string.Join("\n", choices.OrderBy(entry => entry.Key, StringComparer.Ordinal)
+                .Select(entry => $"{entry.Key}={entry.Value}"));
+            if (!visitedChoices.Add(choiceSignature))
+                continue;
+
+            var decisions = new List<DependencyDecision>();
+            try
+            {
+                var plan = ResolveDependencies(roots, installed, choices, decisions);
+                var signature = string.Join("\n", plan.Values
+                    .OrderBy(package => package.Name, StringComparer.Ordinal)
+                    .Select(package => $"{package.Name}={package.Version}"));
+                if (solutionSignatures.Add(signature))
+                    solutions.Add(plan);
+                EnqueueAlternatives(decisions, choices);
+            }
+            catch (DependencyResolutionException exception)
+            {
+                firstFailure ??= exception;
+                EnqueueAlternatives(decisions.Append(exception.Decision), choices);
+            }
+            catch (InvalidOperationException exception)
+            {
+                firstFailure ??= exception;
+            }
+
+        }
+
+        if (solutions.Count == 0)
+            throw CreateDependencyFailure(firstFailure);
+
+        if (solutions.Count == 1)
+            return solutions[0];
+
+        var changesBySolution = solutions
+            .Select(solution => CreatePackageChanges(solution, installed))
+            .ToList();
+        Console.WriteLine($"找到 {solutions.Count} 种依赖解决方案：");
+        for (var index = 0; index < solutions.Count; index++)
+        {
+            Console.WriteLine($"方案 {index + 1}：");
+            foreach (var change in changesBySolution[index])
+            {
+                var versions = change.CurrentVersion is null
+                    ? change.TargetVersion
+                    : change.TargetVersion is null
+                        ? change.CurrentVersion
+                        : $"{change.CurrentVersion} -> {change.TargetVersion}";
+                Console.WriteLine($"  {change.Name,-36} {versions}");
+            }
+        }
+
+        if (Confirmation == ConfirmationMode.Yes)
+        {
+            Console.WriteLine("已指定 -y，自动选择第一个依赖解决方案。");
+            return solutions[0];
+        }
+        if (Confirmation == ConfirmationMode.No || Console.IsInputRedirected)
+        {
+            Console.WriteLine(Confirmation == ConfirmationMode.No
+                ? "已指定 -n，自动选择第一个方案；稍后将取消操作。"
+                : "检测到非交互输入，默认选择第一个方案；后续确认将取消操作。");
+            return solutions[0];
+        }
+
+        while (true)
+        {
+            Console.Write($"选择依赖解决方案 [1-{solutions.Count}]（默认 1，q 取消）：");
+            var response = Console.ReadLine()?.Trim();
+            if (string.IsNullOrEmpty(response) || response == "1")
+                return solutions[0];
+            if (response.Equals("q", StringComparison.OrdinalIgnoreCase))
+                throw new OperationCanceledException("用户取消了依赖解决方案选择。");
+            if (int.TryParse(response, NumberStyles.None, CultureInfo.InvariantCulture, out var selected) &&
+                selected >= 1 && selected <= solutions.Count)
+                return solutions[selected - 1];
+            Console.WriteLine("请输入有效的方案编号，或输入 q 取消。");
+        }
+
+        void EnqueueAlternatives(
+            IEnumerable<DependencyDecision> availableDecisions,
+            IReadOnlyDictionary<string, string> currentChoices)
+        {
+            foreach (var decision in availableDecisions)
+            foreach (var candidate in decision.Candidates)
+            {
+                var candidateIdentity = GetDependencyCandidateIdentity(candidate);
+                if (currentChoices.TryGetValue(decision.Key, out var current) &&
+                    string.Equals(current, candidateIdentity, StringComparison.Ordinal))
+                    continue;
+
+                var alternative = new Dictionary<string, string>(currentChoices, StringComparer.Ordinal)
+                {
+                    [decision.Key] = candidateIdentity
+                };
+                var signature = string.Join("\n", alternative.OrderBy(entry => entry.Key, StringComparer.Ordinal)
+                    .Select(entry => $"{entry.Key}={entry.Value}"));
+                if (!visitedChoices.Contains(signature))
+                    pendingChoices.Enqueue(alternative);
+            }
+        }
+
+        static InvalidOperationException CreateDependencyFailure(Exception? failure)
+        {
+            var reason = failure?.Message ?? "没有找到可行的依赖组合。";
+            return new InvalidOperationException(
+                $"无法解决软件包依赖：{reason}{Environment.NewLine}" +
+                "可选处理方案：1. 检查并启用包含所需软件包/版本的软件源，然后运行 dpm update 重试；" +
+                "2. 换用满足依赖的软件包版本或本地 .deb；3. 取消本次操作。");
+        }
+    }
+
+    private static Dictionary<string, PackageRecord> ResolveDependencies(
+        IReadOnlyList<PackageRecord> roots,
+        IReadOnlyDictionary<string, InstalledPackage> installed,
+        IReadOnlyDictionary<string, string>? dependencyChoices = null,
+        List<DependencyDecision>? decisions = null)
     {
         var packages = LoadPackages();
         var availableByName = packages
@@ -2710,7 +2860,7 @@ internal static class Program
                         continue;
                     }
 
-                    PackageRecord? candidate = null;
+                    var candidateOptions = new List<PackageRecord>();
                     foreach (var alternative in dependency)
                     {
                         var alternatives = new List<PackageRecord>();
@@ -2719,14 +2869,17 @@ internal static class Program
                         if (availableByProvide.TryGetValue(alternative.Name, out var providers))
                             alternatives.AddRange(providers);
 
-                        candidate = alternatives
+                        var candidatesForAlternative = alternatives
                             .Where(package => PackageSatisfies(package, alternative))
                             .DistinctBy(package => $"{package.Name}\n{package.Version}\n{package.Filename}")
-                            .Aggregate<PackageRecord, PackageRecord?>(null, (best, current) =>
-                                best is null || CompareVersions(current.Version, best.Version) > 0 ? current : best);
-                        if (candidate is not null) break;
+                            .OrderByDescending(package => package.Version, Comparer<string>.Create(CompareVersions))
+                            .ToList();
+                        candidateOptions.AddRange(candidatesForAlternative);
                     }
-                    if (candidate is null)
+                    candidateOptions = candidateOptions
+                        .DistinctBy(GetDependencyCandidateIdentity)
+                        .ToList();
+                    if (candidateOptions.Count == 0)
                     {
                         if (optional)
                             continue;
@@ -2736,10 +2889,27 @@ internal static class Program
                             $"Cannot resolve dependency '{expression}' required by {package.Name} {package.Version}.");
                     }
 
+                    var expressionText = string.Join(" | ", dependency.Select(FormatDependency));
+                    var decisionKey = $"{package.Name}={package.Version}:{expressionText}";
+                    var decision = new DependencyDecision(
+                        decisionKey,
+                        expressionText,
+                        package.Name,
+                        candidateOptions);
+                    decisions?.Add(decision);
+                    var candidate = dependencyChoices is not null &&
+                                    dependencyChoices.TryGetValue(decisionKey, out var selectedIdentity)
+                        ? candidateOptions.FirstOrDefault(option =>
+                            string.Equals(GetDependencyCandidateIdentity(option), selectedIdentity,
+                                StringComparison.Ordinal))
+                        : candidateOptions[0];
+                    if (candidate is null)
+                        throw new DependencyResolutionException(decision);
+
                     if (selected.TryGetValue(candidate.Name, out var alreadySelected))
                     {
                         if (!dependency.Any(alternative => PackageSatisfies(alreadySelected, alternative)))
-                            throw new InvalidOperationException(
+                            throw new DependencyResolutionException(decision,
                                 $"Conflicting dependency requirements select incompatible versions of {candidate.Name}.");
                     }
                     else
@@ -2780,6 +2950,9 @@ internal static class Program
             }
         }
     }
+
+    private static string GetDependencyCandidateIdentity(PackageRecord package) =>
+        $"{package.Name}\n{package.Version}\n{package.Filename}";
 
     private static void AddIndexedPackage(
         IDictionary<string, List<PackageRecord>> index,
@@ -3986,6 +4159,23 @@ internal static class Program
         long? Size,
         string? LocalPath = null);
     private sealed record DependencyAlternative(string Name, string? Relation, string? Version);
+    private sealed record DependencyDecision(
+        string Key,
+        string Expression,
+        string RequiringPackage,
+        IReadOnlyList<PackageRecord> Candidates);
+    private sealed class DependencyResolutionException : InvalidOperationException
+    {
+        public DependencyResolutionException(DependencyDecision decision, string? message = null)
+            : base(message ??
+                   $"依赖 '{decision.Expression}' 需要由 {decision.RequiringPackage} 提供，但当前方案与其他依赖冲突。")
+        {
+            Decision = decision;
+        }
+
+        public DependencyDecision Decision { get; }
+    }
+
     private sealed record PackageChange(string Name, string? CurrentVersion, string? TargetVersion, string? Reason = null);
     private sealed record InstalledPackage(
         string Version,
