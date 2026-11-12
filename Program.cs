@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Formats.Tar;
 using System.Globalization;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -13,6 +15,8 @@ internal static class Program
     private const string IndexDirectory = CacheDirectory + "/list";
     private const string PackageDirectory = CacheDirectory + "/deb";
     private const string DpmStateDirectory = "/var/lib/dpm";
+    private const string DpmPackageDirectory = DpmStateDirectory + "/packages";
+    private const string DpmTriggerFile = DpmStateDirectory + "/triggers.json";
     private const string AutoInstalledFile = DpmStateDirectory + "/auto-installed";
     private const string DpmLockFile = "/run/lock/dpm.lock";
     private const int LockExclusive = 2;
@@ -35,6 +39,7 @@ internal static class Program
 
     private static ConfirmationMode Confirmation = ConfirmationMode.Prompt;
     private static List<PackageRecord>? PackageCache;
+    private static HashSet<string>? SystemPackageFiles;
 
     private static async Task<int> Main(string[] args)
     {
@@ -125,10 +130,12 @@ internal static class Program
                 case "check":
                     RequireCount(args, 1);
                     await RunDpkgAsync(["--audit"]);
+                    CheckDpmStatus();
                     break;
                 case "check-filesystem":
                     RequireCount(args, 1);
                     await RunDpkgAsync(["--verify"]);
+                    CheckDpmFiles();
                     break;
                 case "download":
                     RequireCount(args, 2);
@@ -153,6 +160,35 @@ internal static class Program
         {
             Console.Error.WriteLine($"Error: {ex.Message}");
             return 1;
+        }
+    }
+
+    private static async Task ValidateSystemPackageFilesAsync(string packageFile, PackageRecord expected)
+    {
+        var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workDirectory);
+        try
+        {
+            var (_, dataArchive) = ExtractDebMembers(packageFile, workDirectory);
+            var dataTar = await DecompressArchiveAsync(dataArchive, workDirectory);
+            var (files, directories) = ReadTarManifest(dataTar);
+            var dpmPackages = ReadDpmPackages();
+            foreach (var path in files)
+            foreach (var package in dpmPackages)
+            {
+                if (!package.Files.Contains(path, StringComparer.Ordinal))
+                    continue;
+                if (directories.Contains(path, StringComparer.Ordinal) &&
+                    package.Directories.Contains(path, StringComparer.Ordinal))
+                    continue;
+                throw new InvalidOperationException(
+                    $"System package '{expected.Name}' conflicts with dpm-managed package '{package.Name}' at /{path}.");
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(workDirectory))
+                Directory.Delete(workDirectory, true);
         }
     }
 
@@ -186,19 +222,19 @@ internal static class Program
               dpm update
               dpm up                    (alias for update)
               dpm check-sources         (check configured source suite, architecture, and indexes)
-              dpm install PACKAGE|FILE.deb [PACKAGE|FILE.deb ...] (updates indexes before installing)
+              dpm install PACKAGE|PATTERN|FILE.deb [...] (updates indexes before installing)
               dpm fix                   (repair missing dependencies and configure pending packages)
               dpm -f | -fix             (alias for fix)
               dpm -f install PACKAGE... (repair existing dependencies and install packages)
-              dpm reinstall PACKAGE    (reinstalls the installed package version)
-              dpm remove PACKAGE [PACKAGE ...]
-              dpm uninstall PACKAGE [PACKAGE ...] (alias for remove)
-              dpm purge PACKAGE [PACKAGE ...] (remove packages and their configuration files)
-              dpm upgrade [PACKAGE]
+              dpm reinstall PACKAGE|PATTERN
+              dpm remove PACKAGE|PATTERN [...]
+              dpm uninstall PACKAGE|PATTERN [...] (alias for remove)
+              dpm purge PACKAGE|PATTERN [...] (remove packages and their configuration files)
+              dpm upgrade [PACKAGE|PATTERN]
               dpm upgrade-dpm           (upgrade dpm from the latest GitHub release)
               dpm check                 (dpkg consistency audit)
               dpm check-filesystem      (verify installed package files)
-              dpm download PACKAGE
+              dpm download PACKAGE|PATTERN
               dpm clear                 (clear downloaded .deb cache)
               dpm search TERM
             Options:
@@ -583,11 +619,18 @@ internal static class Program
         var requestedRoots = new List<PackageRecord>(packageArguments.Count);
         foreach (var packageArgument in packageArguments)
         {
-            var root = await LoadLocalPackageAsync(packageArgument) ?? SelectCandidate(packageArgument);
-            if (root is null)
+            var localPackage = await LoadLocalPackageAsync(packageArgument);
+            if (localPackage is not null)
+            {
+                requestedRoots.Add(localPackage);
+                continue;
+            }
+
+            var matches = SelectCandidates(packageArgument);
+            if (matches.Count == 0)
                 throw new InvalidOperationException(
                     $"Package '{packageArgument}' was not found in the package indexes.");
-            requestedRoots.Add(root);
+            requestedRoots.AddRange(matches);
         }
 
         var conflictingRoots = requestedRoots
@@ -632,7 +675,7 @@ internal static class Program
             await InstallPackagesAsync(files, orderedPlan);
         }
         if (!string.IsNullOrWhiteSpace(pendingConfiguration))
-            await RunDpkgAsync(["--configure", "--pending"]);
+            await ConfigurePendingPackagesAsync();
 
         var autoInstalled = ReadDpmAutoInstalled();
         autoInstalled.RemoveWhere(name =>
@@ -714,11 +757,34 @@ internal static class Program
         var result = await RunProcessAsync("dpkg", ["--audit"]);
         if (result.ExitCode != 0)
             throw new InvalidOperationException($"Could not audit dpkg state: {result.Error.Trim()}");
-        return result.Output.Trim();
+        var dpmPending = ReadDpmPackages()
+            .Where(package => package.Status is "half-installed" or "unpacked" or "half-configured")
+            .Select(package => $"{package.Name} {package.Version} ({package.Status})");
+        return string.Join(Environment.NewLine,
+            new[]
+                {
+                    result.Output.Trim(),
+                    string.Join(Environment.NewLine, dpmPending),
+                    ReadDpmTriggerState().Pending.Count == 0 ? "" : "dpm triggers pending"
+                }
+                .Where(text => !string.IsNullOrWhiteSpace(text)));
+    }
+
+    private static async Task ConfigurePendingPackagesAsync()
+    {
+        var result = await RunProcessAsync("dpkg", ["--audit"]);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException($"Could not audit dpkg state: {result.Error.Trim()}");
+        if (!string.IsNullOrWhiteSpace(result.Output))
+            await RunDpkgAsync(["--configure", "--pending"]);
+        await ConfigurePendingDpmPackagesAsync();
     }
 
     private static async Task<PackageRecord?> LoadLocalPackageAsync(string packageArgument)
     {
+        if (HasWildcard(packageArgument))
+            return null;
+
         var isPath = File.Exists(packageArgument) ||
                      Path.IsPathRooted(packageArgument) ||
                      packageArgument.EndsWith(".deb", StringComparison.OrdinalIgnoreCase) ||
@@ -731,18 +797,13 @@ internal static class Program
         if (!File.Exists(path))
             throw new FileNotFoundException($"Local package file was not found: {packageArgument}");
 
-        var result = await RunProcessAsync("dpkg-deb", ["--field", path]);
-        if (result.ExitCode != 0)
-            throw new InvalidDataException(
-                $"Could not read local Debian package '{packageArgument}': {result.Error.Trim()}");
-
-        var fields = ParseParagraphs(result.Output).FirstOrDefault()
-                     ?? throw new InvalidDataException($"Local package '{packageArgument}' has no control metadata.");
+        var fields = await ReadDebControlFieldsAsync(path);
         if (!fields.TryGetValue("Package", out var name) ||
             !fields.TryGetValue("Version", out var version) ||
             !fields.TryGetValue("Architecture", out var packageArchitecture))
             throw new InvalidDataException(
                 $"Local package '{packageArgument}' is missing Package, Version, or Architecture metadata.");
+        EnsureValidPackageName(name);
 
         var systemArchitecture = await GetArchitectureAsync();
         if (packageArchitecture != "all" && packageArchitecture != systemArchitecture)
@@ -769,18 +830,27 @@ internal static class Program
     private static async Task ReinstallAsync(string packageName)
     {
         var installed = await GetInstalledAsync();
-        var current = installed.FirstOrDefault(entry => PackageNameMatches(entry.Key, packageName));
-        if (current.Key is null)
+        var matches = installed
+            .Where(entry => MatchesPackageName(entry.Key, packageName))
+            .Take(HasWildcard(packageName) ? int.MaxValue : 1)
+            .ToList();
+        if (matches.Count == 0)
             throw new InvalidOperationException($"Package '{packageName}' is not installed.");
 
-        var root = LoadPackages().FirstOrDefault(package =>
-            PackageNameMatches(package.Name, current.Key) &&
-            package.Version == current.Value.Version);
-        if (root is null)
-            throw new InvalidOperationException(
-                $"Package '{current.Key}' version {current.Value.Version} is not available in the configured repositories.");
+        var available = LoadPackages();
+        var roots = new List<PackageRecord>();
+        foreach (var current in matches)
+        {
+            var root = available.FirstOrDefault(package =>
+                PackageNameMatches(package.Name, current.Key) &&
+                package.Version == current.Value.Version);
+            if (root is null)
+                throw new InvalidOperationException(
+                    $"Package '{current.Key}' version {current.Value.Version} is not available in the configured repositories.");
+            roots.Add(root);
+        }
 
-        var plan = ResolveDependencies([root], installed);
+        var plan = ResolveDependencies(roots, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("重新安装", changes))
@@ -789,20 +859,46 @@ internal static class Program
         var files = await DownloadPackagesAsync(orderedPlan);
         await InstallPackagesAsync(files, orderedPlan);
         var autoInstalled = ReadDpmAutoInstalled();
-        AddNewAutomaticDependencies(autoInstalled, plan, installed, [root.Name]);
+        AddNewAutomaticDependencies(autoInstalled, plan, installed, roots.Select(root => root.Name));
         WriteDpmAutoInstalled(autoInstalled);
     }
 
     private static async Task RemoveAsync(IReadOnlyList<string> packageNames, bool purge)
     {
         var installed = await GetInstalledAsync();
+        var dpmStates = ReadDpmPackages();
+        var systemConfigFiles = purge ? await GetSystemConfigFilesAsync() : [];
         var removalSet = new HashSet<string>(StringComparer.Ordinal);
         foreach (var packageName in packageNames)
         {
-            var match = installed.FirstOrDefault(entry => PackageNameMatches(entry.Key, packageName));
-            if (match.Key is null)
+            var matches = installed
+                .Where(entry => MatchesPackageName(entry.Key, packageName))
+                .Select(entry => entry.Key)
+                .Take(HasWildcard(packageName) ? int.MaxValue : 1)
+                .ToList();
+            if (matches.Count == 0 && purge)
+            {
+                matches = dpmStates
+                    .Where(package => package.Status == "config-files" &&
+                                      MatchesPackageName(package.Name, packageName))
+                    .Select(package => package.Name)
+                    .Take(HasWildcard(packageName) ? int.MaxValue : 1)
+                    .ToList();
+                matches.AddRange(systemConfigFiles
+                    .Where(name => MatchesPackageName(name, packageName) &&
+                                   !matches.Contains(name, StringComparer.Ordinal))
+                    .Take(HasWildcard(packageName) ? int.MaxValue : 1));
+            }
+            if (matches.Count == 0)
+                matches = dpmStates
+                    .Where(package => (package.Status is "half-installed" or "unpacked" or "half-configured") &&
+                                      MatchesPackageName(package.Name, packageName))
+                    .Select(package => package.Name)
+                    .Take(HasWildcard(packageName) ? int.MaxValue : 1)
+                    .ToList();
+            if (matches.Count == 0)
                 throw new InvalidOperationException($"Installed package '{packageName}' was not found.");
-            removalSet.Add(match.Key);
+            removalSet.UnionWith(matches);
         }
 
         var autoInstalled = ReadAutoInstalledPackages();
@@ -822,25 +918,58 @@ internal static class Program
         }
 
         var changes = removalSet
-            .Select(name => new PackageChange(
-                name,
-                installed[name].Version,
-                null,
-                packageNames.Any(packageName => PackageNameMatches(name, packageName))
-                    ? null
-                    : "自动安装的孤儿依赖"))
+            .Select(name =>
+            {
+                var currentVersion = installed.TryGetValue(name, out var current)
+                    ? current.Version
+                    : dpmStates.FirstOrDefault(package => package.Name == name)?.Version;
+                return new PackageChange(
+                    name,
+                    currentVersion,
+                    null,
+                    packageNames.Any(packageName => MatchesPackageName(name, packageName))
+                        ? null
+                        : "自动安装的孤儿依赖");
+            })
             .OrderBy(change => change.Name, StringComparer.Ordinal)
             .ToList();
         var action = purge ? "彻底清除" : "卸载";
         if (!ConfirmPackageChanges(action, changes))
             return;
 
-        var dpkgAction = purge ? "--purge" : "--remove";
-        await RunDpkgAsync(
-            [dpkgAction, "--", .. removalSet.Order(StringComparer.Ordinal)],
-            removalSet.Count,
-            true,
-            removalSet);
+        var systemInstalled = await GetSystemInstalledAsync();
+        var removalOrder = OrderPackagesForRemoval(installed, removalSet);
+        for (var index = 0; index < removalOrder.Count;)
+        {
+            var systemManaged = systemInstalled.Keys.Any(name =>
+                                     PackageNameMatches(name, removalOrder[index])) ||
+                                 systemConfigFiles.Any(name =>
+                                     PackageNameMatches(name, removalOrder[index]));
+            var groupStart = index++;
+            while (index < removalOrder.Count)
+            {
+                var nextSystemManaged = systemInstalled.Keys.Any(name =>
+                                            PackageNameMatches(name, removalOrder[index])) ||
+                                        systemConfigFiles.Any(name =>
+                                            PackageNameMatches(name, removalOrder[index]));
+                if (nextSystemManaged != systemManaged)
+                    break;
+                index++;
+            }
+            var group = removalOrder.Skip(groupStart).Take(index - groupStart).ToArray();
+            if (!systemManaged)
+            {
+                await RemoveDpmPackagesAsync(group, purge);
+                continue;
+            }
+
+            var dpkgAction = purge ? "--purge" : "--remove";
+            await RunDpkgAsync(
+                [dpkgAction, "--", .. group],
+                group.Length,
+                true,
+                group.ToHashSet(StringComparer.Ordinal));
+        }
         var dpmAutoInstalled = ReadDpmAutoInstalled();
         dpmAutoInstalled.ExceptWith(removalSet);
         WriteDpmAutoInstalled(dpmAutoInstalled);
@@ -849,8 +978,11 @@ internal static class Program
     private static async Task UpgradeAsync(string? packageName)
     {
         var installed = await GetInstalledAsync();
+        if (packageName is not null && HasWildcard(packageName) &&
+            !LoadPackages().Any(package => MatchesPackageName(package.Name, packageName)))
+            throw new InvalidOperationException($"Package pattern '{packageName}' matched no packages in the package indexes.");
         var candidates = LoadPackages()
-            .Where(p => packageName is null || PackageNameMatches(p.Name, packageName))
+            .Where(p => packageName is null || MatchesPackageName(p.Name, packageName))
             .GroupBy(p => p.Name, StringComparer.Ordinal)
             .Select(group => SelectNewest(group)!)
             .Select(p => new
@@ -1048,12 +1180,7 @@ internal static class Program
             if (!await HasHashAsync(temporaryPackage, expectedHash))
                 throw new InvalidDataException("Downloaded dpm package SHA256 does not match the GitHub release digest.");
 
-            var metadata = await RunProcessAsync("dpkg-deb", ["--field", temporaryPackage]);
-            if (metadata.ExitCode != 0)
-                throw new InvalidDataException(
-                    $"Could not inspect downloaded dpm package: {metadata.Error.Trim()}");
-            var fields = ParseParagraphs(metadata.Output).FirstOrDefault()
-                         ?? throw new InvalidDataException("Downloaded dpm package has no control metadata.");
+            var fields = await ReadDebControlFieldsAsync(temporaryPackage);
             if (!fields.TryGetValue("Package", out var packageName) ||
                 packageName != "dpm" ||
                 !fields.TryGetValue("Version", out var packageVersion) ||
@@ -1063,16 +1190,28 @@ internal static class Program
                 throw new InvalidDataException(
                     "Downloaded package metadata does not match the requested dpm release and system architecture.");
 
-            var dpkgArguments = new List<string>();
-            if (versionComparison < 0)
-                dpkgArguments.Add("--force-downgrade");
-            dpkgArguments.Add("--install");
-            dpkgArguments.Add(temporaryPackage);
-            await RunDpkgAsync(
-                dpkgArguments,
-                1,
-                true,
-                new HashSet<string>(["dpm"], StringComparer.Ordinal));
+            var systemInstalled = await GetSystemInstalledAsync();
+            if (systemInstalled.Keys.Any(name => PackageNameMatches(name, "dpm")))
+            {
+                var dpkgArguments = new List<string>();
+                if (versionComparison < 0)
+                    dpkgArguments.Add("--force-downgrade");
+                dpkgArguments.Add("--install");
+                dpkgArguments.Add(temporaryPackage);
+                await RunDpkgAsync(
+                    dpkgArguments,
+                    1,
+                    true,
+                    new HashSet<string>(["dpm"], StringComparer.Ordinal));
+            }
+            else
+            {
+                var package = new PackageRecord(
+                    "dpm", targetVersion, Path.GetFileName(temporaryPackage), "", "",
+                    "", "", "", "", "", false, new FileInfo(temporaryPackage).Length);
+                await InstallDpmPackageAsync(temporaryPackage, package);
+                await ProcessDpmTriggersAsync();
+            }
             Console.WriteLine($"dpm 已升级到 {targetVersion}。");
         }
         finally
@@ -1110,6 +1249,50 @@ internal static class Program
         IReadOnlyList<string> files,
         IReadOnlyList<PackageRecord> packages)
     {
+        if (files.Count != packages.Count)
+            throw new InvalidOperationException("The downloaded package list does not match the installation plan.");
+
+        var systemManagedPackages = await GetSystemManagedPackageNamesAsync();
+        var dpmInstallCount = 0;
+        var index = 0;
+        while (index < packages.Count)
+        {
+            var systemManaged = systemManagedPackages.Any(name =>
+                PackageNameMatches(name, packages[index].Name));
+            var groupStart = index++;
+            while (index < packages.Count)
+            {
+                var nextSystemManaged = systemManagedPackages.Any(name =>
+                    PackageNameMatches(name, packages[index].Name));
+                if (nextSystemManaged != systemManaged)
+                    break;
+                index++;
+            }
+            var groupFiles = files.Skip(groupStart).Take(index - groupStart).ToArray();
+            var groupPackages = packages.Skip(groupStart).Take(index - groupStart).ToArray();
+            if (systemManaged)
+                await InstallSystemPackagesAsync(groupFiles, groupPackages);
+            else
+            {
+                for (var item = 0; item < groupPackages.Length; item++)
+                {
+                    await InstallDpmPackageAsync(groupFiles[item], groupPackages[item]);
+                    dpmInstallCount++;
+                }
+            }
+        }
+
+        if (dpmInstallCount > 0)
+            await ProcessDpmTriggersAsync();
+    }
+
+    private static async Task InstallSystemPackagesAsync(
+        IReadOnlyList<string> files,
+        IReadOnlyList<PackageRecord> packages)
+    {
+        for (var index = 0; index < packages.Count; index++)
+            await ValidateSystemPackageFilesAsync(files[index], packages[index]);
+
         try
         {
             await RunDpkgAsync(
@@ -1120,8 +1303,7 @@ internal static class Program
         }
         catch (InvalidOperationException installError)
         {
-            Console.Error.WriteLine(
-                "警告: dpkg 安装未完全成功，正在重试配置待配置的软件包。");
+            Console.Error.WriteLine("警告: dpkg 安装未完全成功，正在重试配置待配置的软件包。");
             try
             {
                 await RunDpkgAsync(["--configure", "--pending"]);
@@ -1133,7 +1315,7 @@ internal static class Program
                     installError);
             }
 
-            var installed = await GetInstalledAsync();
+            var installed = await GetSystemInstalledAsync();
             var incomplete = packages
                 .Where(package =>
                 {
@@ -1148,8 +1330,982 @@ internal static class Program
                 throw new InvalidOperationException(
                     $"{installError.Message} 重试配置后仍未安装或版本不匹配: {string.Join(", ", incomplete)}");
 
-            Console.Error.WriteLine(
-                "警告: 重试配置成功，已确认本次计划中的软件包均已安装。");
+            Console.Error.WriteLine("警告: 重试配置成功，已确认 dpkg 管理的软件包均已安装。");
+        }
+        SystemPackageFiles = null;
+    }
+
+    private static async Task InstallDpmPackageAsync(string packageFile, PackageRecord expected)
+    {
+        Directory.CreateDirectory(DpmStateDirectory);
+        Directory.CreateDirectory(DpmPackageDirectory);
+        var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workDirectory);
+        try
+        {
+            var (controlArchive, dataArchive) = ExtractDebMembers(packageFile, workDirectory);
+
+            var controlTar = await DecompressArchiveAsync(controlArchive, workDirectory);
+            var dataTar = await DecompressArchiveAsync(dataArchive, workDirectory);
+            var controlDirectory = Path.Combine(workDirectory, "control");
+            var dataDirectory = Path.Combine(workDirectory, "data");
+            Directory.CreateDirectory(controlDirectory);
+            await ExtractTarToDirectoryAsync(controlTar, controlDirectory);
+
+            var controlText = ReadControlFile(controlDirectory, "control")
+                              ?? throw new InvalidDataException($"Package '{expected.Name}' has no control file.");
+            var control = ParseParagraphs(controlText).FirstOrDefault()
+                          ?? throw new InvalidDataException($"Package '{expected.Name}' has empty control metadata.");
+            if (!control.TryGetValue("Package", out var packageName) ||
+                !control.TryGetValue("Version", out var version) ||
+                !control.TryGetValue("Architecture", out var architecture) ||
+                packageName != expected.Name || version != expected.Version)
+                throw new InvalidDataException(
+                    $"Downloaded package metadata does not match {expected.Name} {expected.Version}.");
+            EnsureValidPackageName(packageName);
+            var systemArchitecture = await GetArchitectureAsync();
+            if (architecture != "all" && architecture != systemArchitecture)
+                throw new InvalidDataException(
+                    $"Package '{packageName}' is for {architecture}, but this system is {systemArchitecture}.");
+
+            var (paths, directories) = await ExtractTarToDirectoryAsync(dataTar, dataDirectory);
+
+            var states = ReadDpmPackages();
+            var previous = states.FirstOrDefault(package => package.Name == packageName);
+            var previousVersion = previous?.Version;
+            var conffiles = ReadConffiles(controlDirectory);
+            if (conffiles.Any(path => !paths.Contains(path, StringComparer.Ordinal)))
+                throw new InvalidDataException(
+                    $"Package '{packageName}' lists a conffile that is absent from its data archive.");
+            var scripts = ReadMaintainerScripts(controlDirectory);
+            var triggerDeclarations = ReadTriggerDeclarations(controlDirectory);
+            var newState = new DpmPackageState(
+                packageName,
+                version,
+                architecture,
+                "unpacked",
+                control.GetValueOrDefault("Provides", ""),
+                control.GetValueOrDefault("Pre-Depends", ""),
+                control.GetValueOrDefault("Depends", ""),
+                control.GetValueOrDefault("Recommends", ""),
+                paths,
+                directories,
+                conffiles,
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                new Dictionary<string, string>(StringComparer.Ordinal),
+                scripts,
+                triggerDeclarations.Interests,
+                triggerDeclarations.Activations);
+
+            ValidateDpmPackageFiles(newState, previous);
+            var triggerQueue = Path.Combine(workDirectory, "trigger-queue");
+            await RunMaintainerScriptAsync(previous, "prerm", ["upgrade", version], workDirectory, triggerQueue);
+            await RunMaintainerScriptAsync(newState, "preinst",
+                previousVersion is null ? ["install"] : ["upgrade", previousVersion],
+                workDirectory, triggerQueue);
+
+            WriteDpmPackage(newState with { Status = "half-installed" });
+            await CopyDpmPackageFilesAsync(dataDirectory, newState, previous);
+            if (previous is not null)
+                RemoveObsoleteDpmFiles(previous, newState);
+
+            newState = newState with { Status = "unpacked" };
+            WriteDpmPackage(newState);
+            await RunMaintainerScriptAsync(previous, "postrm", ["upgrade", version], workDirectory, triggerQueue);
+            newState = newState with { Status = "half-configured" };
+            WriteDpmPackage(newState);
+            await RunMaintainerScriptAsync(newState, "postinst",
+                previousVersion is null ? ["configure"] : ["configure", previousVersion],
+                workDirectory, triggerQueue);
+            newState = newState with { Status = "installed" };
+            WriteDpmPackage(newState);
+            AddRequestedDpmTriggers(triggerQueue);
+            ActivateDpmTriggers(newState.TriggerActivations);
+        }
+        finally
+        {
+            if (Directory.Exists(workDirectory))
+                Directory.Delete(workDirectory, true);
+        }
+    }
+
+    private static (string ControlArchive, string DataArchive) ExtractDebMembers(
+        string packageFile,
+        string workDirectory)
+    {
+        using var input = File.OpenRead(packageFile);
+        Span<byte> magic = stackalloc byte[8];
+        input.ReadExactly(magic);
+        if (!magic.SequenceEqual(Encoding.ASCII.GetBytes("!<arch>\n")))
+            throw new InvalidDataException($"'{packageFile}' is not a Debian ar archive.");
+
+        var foundControl = false;
+        var foundData = false;
+        Span<byte> header = stackalloc byte[60];
+        while (input.Position < input.Length)
+        {
+            if (input.Length - input.Position < header.Length)
+                throw new InvalidDataException($"'{packageFile}' has a truncated ar member header.");
+            input.ReadExactly(header);
+            if (header[58] != (byte)'`' || header[59] != (byte)'\n')
+                throw new InvalidDataException($"'{packageFile}' has an invalid ar member header.");
+            var memberName = Encoding.ASCII.GetString(header[..16]).Trim().TrimEnd('/');
+            var sizeText = Encoding.ASCII.GetString(header.Slice(48, 10)).Trim();
+            if (!long.TryParse(sizeText, NumberStyles.None, CultureInfo.InvariantCulture, out var memberSize) ||
+                memberSize < 0 || memberSize > input.Length - input.Position)
+                throw new InvalidDataException($"'{packageFile}' has an invalid ar member size.");
+
+            var isControl = memberName.StartsWith("control.tar", StringComparison.Ordinal);
+            var isData = memberName.StartsWith("data.tar", StringComparison.Ordinal);
+            if ((isControl && foundControl) || (isData && foundData))
+                throw new InvalidDataException($"'{packageFile}' contains duplicate control or data archives.");
+            if ((isControl || isData) &&
+                (memberName.Contains('/') || memberName.Contains('\\')))
+                throw new InvalidDataException($"'{packageFile}' has an invalid ar member name.");
+            var destination = isControl
+                ? Path.Combine(workDirectory, memberName)
+                : isData
+                    ? Path.Combine(workDirectory, memberName)
+                    : null;
+            if (destination is not null)
+            {
+                using var output = File.Create(destination);
+                CopyExactly(input, output, memberSize);
+                if (isControl)
+                    foundControl = true;
+                else
+                    foundData = true;
+            }
+            else
+                input.Seek(memberSize, SeekOrigin.Current);
+            if ((memberSize & 1) != 0)
+            {
+                if (input.Position >= input.Length)
+                    throw new InvalidDataException($"'{packageFile}' has missing ar member padding.");
+                input.Seek(1, SeekOrigin.Current);
+            }
+        }
+
+        if (!foundControl || !foundData)
+            throw new InvalidDataException($"'{packageFile}' is missing control.tar or data.tar.");
+        return (
+            Directory.EnumerateFiles(workDirectory).First(path =>
+                Path.GetFileName(path).StartsWith("control.tar", StringComparison.Ordinal)),
+            Directory.EnumerateFiles(workDirectory).First(path =>
+                Path.GetFileName(path).StartsWith("data.tar", StringComparison.Ordinal)));
+    }
+
+    private static async Task<Dictionary<string, string>> ReadDebControlFieldsAsync(string packagePath)
+    {
+        var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workDirectory);
+        try
+        {
+            var (controlArchive, _) = ExtractDebMembers(packagePath, workDirectory);
+            var controlTar = await DecompressArchiveAsync(controlArchive, workDirectory);
+            var controlDirectory = Path.Combine(workDirectory, "control");
+            Directory.CreateDirectory(controlDirectory);
+            await ExtractTarToDirectoryAsync(controlTar, controlDirectory);
+            var controlText = ReadControlFile(controlDirectory, "control")
+                              ?? throw new InvalidDataException($"Local package '{packagePath}' has no control file.");
+            return ParseParagraphs(controlText).FirstOrDefault()
+                   ?? throw new InvalidDataException($"Local package '{packagePath}' has empty control metadata.");
+        }
+        finally
+        {
+            if (Directory.Exists(workDirectory))
+                Directory.Delete(workDirectory, true);
+        }
+    }
+
+    private static void CopyExactly(Stream input, Stream output, long bytesToCopy)
+    {
+        var buffer = new byte[81920];
+        while (bytesToCopy > 0)
+        {
+            var read = input.Read(buffer, 0, (int)Math.Min(buffer.Length, bytesToCopy));
+            if (read == 0)
+                throw new EndOfStreamException("Unexpected end of Debian archive member.");
+            output.Write(buffer, 0, read);
+            bytesToCopy -= read;
+        }
+    }
+
+    private static async Task<string> DecompressArchiveAsync(string archivePath, string workDirectory)
+    {
+        var extension = Path.GetExtension(archivePath);
+        var destination = Path.Combine(workDirectory, Path.GetFileName(archivePath) + ".tar");
+        var command = extension switch
+        {
+            ".gz" => "gzip",
+            ".xz" => "xz",
+            ".lzma" => "xz",
+            ".bz2" => "bzip2",
+            ".lz4" => "lz4",
+            ".zst" => "zstd",
+            ".tar" => null,
+            _ => throw new InvalidDataException($"Unsupported Debian archive compression: {extension}")
+        };
+        if (command is null)
+        {
+            File.Copy(archivePath, destination, true);
+            return destination;
+        }
+
+        await DecompressAsync(command, ["-dc", archivePath], destination);
+        return destination;
+    }
+
+    private static async Task<(List<string> Paths, List<string> Directories)> ExtractTarToDirectoryAsync(
+        string tarPath,
+        string destinationDirectory)
+    {
+        var paths = new List<string>();
+        var directories = new List<string>();
+        var directoryModes = new Dictionary<string, UnixFileMode>(StringComparer.Ordinal);
+        Directory.CreateDirectory(destinationDirectory);
+        using var stream = File.OpenRead(tarPath);
+        using var reader = new TarReader(stream);
+        while (reader.GetNextEntry(false) is { } entry)
+        {
+            var path = NormalizePackagePath(entry.Name);
+            if (path.Length == 0)
+                continue;
+            var entryPath = Path.Combine(destinationDirectory, path);
+            EnsureSafeExtractionParents(destinationDirectory, path);
+            switch (entry.EntryType)
+            {
+                case TarEntryType.Directory:
+                    Directory.CreateDirectory(entryPath);
+                    if (!directories.Contains(path, StringComparer.Ordinal))
+                        directories.Add(path);
+                    directoryModes[path] = entry.Mode;
+                    break;
+                case TarEntryType.SymbolicLink:
+                    File.CreateSymbolicLink(entryPath, entry.LinkName);
+                    break;
+                case TarEntryType.HardLink:
+                {
+                    var target = Path.Combine(destinationDirectory, NormalizePackagePath(entry.LinkName));
+                    if (!File.Exists(target))
+                        throw new InvalidDataException($"Package hard link target does not exist: {entry.LinkName}");
+                    File.Copy(target, entryPath);
+                    break;
+                }
+                case TarEntryType.RegularFile:
+                case TarEntryType.V7RegularFile:
+                case TarEntryType.ContiguousFile:
+                    await using (var output = new FileStream(
+                                     entryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                    {
+                        if (entry.DataStream is not null)
+                            await entry.DataStream.CopyToAsync(output);
+                    }
+                    if (!OperatingSystem.IsWindows())
+                        File.SetUnixFileMode(entryPath, entry.Mode);
+                    break;
+                default:
+                    throw new InvalidDataException(
+                        $"Package contains an unsupported tar entry type: {entry.EntryType} ({entry.Name})");
+            }
+
+            if (!paths.Contains(path, StringComparer.Ordinal))
+                paths.Add(path);
+        }
+
+        if (!OperatingSystem.IsWindows())
+        foreach (var directory in directories.OrderByDescending(path => path.Count(character => character == '/')))
+            if (directoryModes.TryGetValue(directory, out var mode))
+                File.SetUnixFileMode(Path.Combine(destinationDirectory, directory), mode);
+
+        return (paths, directories);
+    }
+
+    private static (List<string> Paths, List<string> Directories) ReadTarManifest(string tarPath)
+    {
+        var paths = new List<string>();
+        var directories = new List<string>();
+        using var stream = File.OpenRead(tarPath);
+        using var reader = new TarReader(stream);
+        while (reader.GetNextEntry(false) is { } entry)
+        {
+            var path = NormalizePackagePath(entry.Name);
+            if (path.Length == 0)
+                continue;
+            if (!paths.Contains(path, StringComparer.Ordinal))
+                paths.Add(path);
+            if (entry.EntryType == TarEntryType.Directory &&
+                !directories.Contains(path, StringComparer.Ordinal))
+                directories.Add(path);
+        }
+        return (paths, directories);
+    }
+
+    private static void EnsureSafeExtractionParents(string root, string relativePath)
+    {
+        var parent = Path.GetDirectoryName(relativePath);
+        if (string.IsNullOrEmpty(parent))
+            return;
+        var current = root;
+        foreach (var segment in parent.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
+        {
+            current = Path.Combine(current, segment);
+            if (File.Exists(current) || Directory.Exists(current))
+            {
+                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException($"Package archive traverses a symbolic link: {relativePath}");
+                if (!Directory.Exists(current))
+                    throw new InvalidDataException($"Package archive has a file as a parent: {relativePath}");
+            }
+            else
+                Directory.CreateDirectory(current);
+        }
+    }
+
+    private static string NormalizePackagePath(string path)
+    {
+        while (path.StartsWith("./", StringComparison.Ordinal))
+            path = path[2..];
+        if (path.StartsWith('/') || Path.IsPathRooted(path))
+            throw new InvalidDataException($"Package contains an absolute path: {path}");
+        var segments = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Any(segment => segment is "." or ".."))
+            throw new InvalidDataException($"Package contains an unsafe path: {path}");
+        return string.Join('/', segments);
+    }
+
+    private static List<string> ReadConffiles(string controlDirectory)
+    {
+        var text = ReadControlFile(controlDirectory, "conffiles");
+        if (text is null)
+            return [];
+        return text.Split('\n')
+            .Select(line => line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => NormalizePackagePath(item!.TrimStart('/')))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static Dictionary<string, string> ReadMaintainerScripts(string controlDirectory)
+    {
+        var scripts = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var name in new[] { "preinst", "postinst", "prerm", "postrm" })
+        {
+            var script = ReadControlFile(controlDirectory, name);
+            if (script is not null)
+                scripts[name] = script;
+        }
+        return scripts;
+    }
+
+    private static string? ReadControlFile(string controlDirectory, string fileName)
+    {
+        var path = Path.Combine(controlDirectory, fileName);
+        if (!File.Exists(path) && !Directory.Exists(path) &&
+            new FileInfo(path).LinkTarget is null)
+            return null;
+        var attributes = File.GetAttributes(path);
+        if ((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) != 0)
+            throw new InvalidDataException($"Package control entry must be a regular file: {fileName}");
+        return File.ReadAllText(path);
+    }
+
+    private static (List<string> Interests, List<string> Activations) ReadTriggerDeclarations(string controlDirectory)
+    {
+        var interests = new List<string>();
+        var activations = new List<string>();
+        var text = ReadControlFile(controlDirectory, "triggers");
+        if (text is null)
+            return (interests, activations);
+        foreach (var line in text.Split('\n'))
+        {
+            var fields = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length != 2)
+                continue;
+            if (fields[0].StartsWith("interest", StringComparison.Ordinal))
+                interests.Add(fields[1]);
+            else if (fields[0].StartsWith("activate", StringComparison.Ordinal))
+                activations.Add(fields[1]);
+        }
+        return (interests.Distinct(StringComparer.Ordinal).ToList(),
+            activations.Distinct(StringComparer.Ordinal).ToList());
+    }
+
+    private static void ValidateDpmPackageFiles(DpmPackageState package, DpmPackageState? previous)
+    {
+        var previousFiles = previous?.Files.ToHashSet(StringComparer.Ordinal) ?? [];
+        var systemFiles = GetSystemPackageFiles();
+        var dpmPackages = ReadDpmPackages();
+        foreach (var path in package.Files)
+        {
+            if (package.Directories.Contains(path, StringComparer.Ordinal))
+                continue;
+            var fullPath = "/" + path;
+            if (!previousFiles.Contains(path) && systemFiles.Contains(fullPath))
+                throw new InvalidOperationException(
+                    $"Package '{package.Name}' would overwrite a file owned by the system package manager: {fullPath}");
+            var currentPathExists = File.Exists(fullPath) || Directory.Exists(fullPath) ||
+                                    new FileInfo(fullPath).LinkTarget is not null;
+            if (currentPathExists && !previousFiles.Contains(path) &&
+                !package.Conffiles.Contains(path, StringComparer.Ordinal))
+                throw new InvalidOperationException(
+                    $"Package '{package.Name}' would overwrite an unmanaged file: {fullPath}");
+            var otherOwner = dpmPackages.FirstOrDefault(installed =>
+                installed.Name != package.Name &&
+                installed.Files.Contains(path, StringComparer.Ordinal) &&
+                !(package.Directories.Contains(path, StringComparer.Ordinal) &&
+                  installed.Directories.Contains(path, StringComparer.Ordinal)));
+            if (otherOwner is not null)
+                throw new InvalidOperationException(
+                    $"Package '{package.Name}' conflicts with dpm-managed package '{otherOwner.Name}' at {fullPath}.");
+        }
+    }
+
+    private static HashSet<string> GetSystemPackageFiles()
+    {
+        if (SystemPackageFiles is not null)
+            return SystemPackageFiles;
+        var files = new HashSet<string>(StringComparer.Ordinal);
+        const string infoDirectory = "/var/lib/dpkg/info";
+        if (Directory.Exists(infoDirectory))
+        {
+            foreach (var listFile in Directory.EnumerateFiles(infoDirectory, "*.list"))
+            foreach (var line in File.ReadLines(listFile))
+                if (line.StartsWith('/') && !line.Contains("/../", StringComparison.Ordinal))
+                    files.Add(Path.GetFullPath(line));
+        }
+        SystemPackageFiles = files;
+        return files;
+    }
+
+    private static async Task CopyDpmPackageFilesAsync(
+        string sourceDirectory,
+        DpmPackageState package,
+        DpmPackageState? previous)
+    {
+        var oldFiles = previous?.Files.ToHashSet(StringComparer.Ordinal) ?? [];
+        var conffiles = package.Conffiles.ToHashSet(StringComparer.Ordinal);
+        var createdDirectories = new List<string>();
+        foreach (var relativePath in package.Files
+                     .ToList()
+                     .OrderBy(path => path.Count(character => character == '/'))
+                     .ThenBy(path => path, StringComparer.Ordinal))
+        {
+            var sourcePath = Path.Combine(sourceDirectory, relativePath);
+            var targetPath = Path.Combine("/", relativePath);
+            FileAttributes attributes;
+            try
+            {
+                attributes = File.GetAttributes(sourcePath);
+            }
+            catch (FileNotFoundException)
+            {
+                throw new InvalidDataException($"Extracted package path is missing: {relativePath}");
+            }
+            var isSymlink = (attributes & FileAttributes.ReparsePoint) != 0;
+            var isDirectory = !isSymlink && (attributes & FileAttributes.Directory) != 0;
+            if (isDirectory)
+            {
+                if (File.Exists(targetPath) && !Directory.Exists(targetPath))
+                    throw new InvalidOperationException($"Cannot create package directory over a file: {targetPath}");
+                var targetExisted = Directory.Exists(targetPath);
+                Directory.CreateDirectory(targetPath);
+                if (!targetExisted)
+                    createdDirectories.Add(relativePath);
+                continue;
+            }
+
+            var targetExists = File.Exists(targetPath) || Directory.Exists(targetPath);
+            var preserveConffile = conffiles.Contains(relativePath) && targetExists &&
+                                   (!oldFiles.Contains(relativePath) ||
+                                    previous is null ||
+                                    PreviousConffileWasModified(previous, relativePath, targetPath));
+            if (preserveConffile)
+            {
+                var newPath = targetPath + ".dpm-new";
+                var newRelativePath = relativePath + ".dpm-new";
+                if (File.Exists(newPath) || Directory.Exists(newPath) ||
+                    new FileInfo(newPath).LinkTarget is not null)
+                {
+                    if (!oldFiles.Contains(newRelativePath) || previous is null ||
+                        !previous.FileHashes.TryGetValue(newRelativePath, out var oldHash) ||
+                        !string.Equals(GetDpmPathHash(newPath), oldHash, StringComparison.Ordinal))
+                        throw new InvalidOperationException(
+                            $"Cannot replace an unmanaged or modified file: {newPath}");
+                    File.Delete(newPath);
+                }
+                await CopyPackageFileAsync(sourcePath, newPath, isSymlink);
+                if (!package.Files.Contains(newRelativePath, StringComparer.Ordinal))
+                    package.Files.Add(newRelativePath);
+                package.FileHashes[newRelativePath] = await GetDpmPathHashAsync(newPath);
+                package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
+                continue;
+            }
+            if (targetExists && !oldFiles.Contains(relativePath))
+                throw new InvalidOperationException(
+                    $"Package '{package.Name}' would overwrite an unmanaged file: {targetPath}");
+
+            var targetIsSymlink = (File.Exists(targetPath) || Directory.Exists(targetPath)) &&
+                                  (File.GetAttributes(targetPath) & FileAttributes.ReparsePoint) != 0;
+            if (Directory.Exists(targetPath) && !targetIsSymlink)
+                throw new InvalidOperationException($"Cannot install a package file over a directory: {targetPath}");
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+            if (File.Exists(targetPath) || Directory.Exists(targetPath) ||
+                new FileInfo(targetPath).LinkTarget is not null)
+                File.Delete(targetPath);
+            await CopyPackageFileAsync(sourcePath, targetPath, isSymlink);
+            package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
+        }
+
+        if (!OperatingSystem.IsWindows())
+        foreach (var relativePath in createdDirectories.OrderByDescending(
+                     path => path.Count(character => character == '/')))
+        {
+            var sourcePath = Path.Combine(sourceDirectory, relativePath);
+            var targetPath = Path.Combine("/", relativePath);
+            File.SetUnixFileMode(targetPath, File.GetUnixFileMode(sourcePath));
+        }
+
+        foreach (var conffile in package.Conffiles)
+        {
+            var sourcePath = Path.Combine(sourceDirectory, conffile);
+            if (File.Exists(sourcePath))
+                package.ConffileHashes[conffile] = await GetFileSha256Async(sourcePath);
+        }
+    }
+
+    private static async Task CopyPackageFileAsync(
+        string sourcePath,
+        string targetPath,
+        bool isSymlink)
+    {
+        if (isSymlink)
+        {
+            var target = (File.GetAttributes(sourcePath) & FileAttributes.Directory) != 0
+                ? new DirectoryInfo(sourcePath).LinkTarget
+                : new FileInfo(sourcePath).LinkTarget;
+            target ??= new FileInfo(sourcePath).LinkTarget;
+            target ??= new DirectoryInfo(sourcePath).LinkTarget;
+            if (target is null)
+                throw new InvalidDataException($"Package symlink has no target: {sourcePath}");
+            File.CreateSymbolicLink(targetPath, target);
+            return;
+        }
+
+        var temporaryPath = targetPath + ".dpm-tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            await using (var source = File.OpenRead(sourcePath))
+            await using (var destination = new FileStream(
+                             temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                await source.CopyToAsync(destination);
+            File.Move(temporaryPath, targetPath, true);
+            if (!OperatingSystem.IsWindows())
+            {
+                try
+                {
+                    File.SetUnixFileMode(targetPath, File.GetUnixFileMode(sourcePath));
+                }
+                catch (PlatformNotSupportedException)
+                {
+                }
+            }
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+        }
+    }
+
+    private static void RemoveObsoleteDpmFiles(DpmPackageState previous, DpmPackageState current)
+    {
+        var currentFiles = current.Files.ToHashSet(StringComparer.Ordinal);
+        foreach (var path in previous.Files.Where(path => !currentFiles.Contains(path)))
+        {
+            if (previous.Conffiles.Contains(path, StringComparer.Ordinal))
+                continue;
+            DeleteDpmPath(previous, path);
+        }
+    }
+
+    private static bool PreviousConffileWasModified(
+        DpmPackageState package,
+        string relativePath,
+        string targetPath)
+    {
+        if (!package.ConffileHashes.TryGetValue(relativePath, out var expectedHash))
+            return true;
+        using var stream = File.OpenRead(targetPath);
+        var actualHash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        return !CryptographicOperations.FixedTimeEquals(
+            Encoding.ASCII.GetBytes(actualHash),
+            Encoding.ASCII.GetBytes(expectedHash));
+    }
+
+    private static async Task<string> GetFileSha256Async(string path)
+    {
+        await using var stream = File.OpenRead(path);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
+    }
+
+    private static string GetDpmPathHash(string path)
+    {
+        var attributes = File.GetAttributes(path);
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            var linkTarget = (attributes & FileAttributes.Directory) != 0
+                ? new DirectoryInfo(path).LinkTarget
+                : new FileInfo(path).LinkTarget;
+            return "link:" + (linkTarget ?? "");
+        }
+        using var stream = File.OpenRead(path);
+        return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+    }
+
+    private static async Task<string> GetDpmPathHashAsync(string path)
+    {
+        var attributes = File.GetAttributes(path);
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            var linkTarget = (attributes & FileAttributes.Directory) != 0
+                ? new DirectoryInfo(path).LinkTarget
+                : new FileInfo(path).LinkTarget;
+            return "link:" + (linkTarget ?? "");
+        }
+        await using var stream = File.OpenRead(path);
+        return Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
+    }
+
+    private static void DeleteDpmPath(DpmPackageState package, string relativePath)
+    {
+        var path = Path.Combine("/", relativePath);
+        if (Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0)
+        {
+            try
+            {
+                Directory.Delete(path, false);
+            }
+            catch (IOException)
+            {
+            }
+        }
+        else if (File.Exists(path) || Directory.Exists(path) ||
+                 new FileInfo(path).LinkTarget is not null || new DirectoryInfo(path).LinkTarget is not null)
+        {
+            if (!package.FileHashes.TryGetValue(relativePath, out var expectedHash) ||
+                !string.Equals(GetDpmPathHash(path), expectedHash, StringComparison.Ordinal))
+            {
+                Console.Error.WriteLine($"警告: 已保留被修改或不再匹配的文件 {path}");
+                return;
+            }
+            File.Delete(path);
+        }
+    }
+
+    private static async Task RemoveDpmPackagesAsync(IReadOnlyList<string> packageNames, bool purge)
+    {
+        var states = ReadDpmPackages();
+        foreach (var packageName in packageNames)
+        {
+            var package = states.FirstOrDefault(item => item.Name == packageName)
+                          ?? throw new InvalidOperationException($"dpm package state is missing for '{packageName}'.");
+            var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(workDirectory);
+            try
+            {
+                var triggerQueue = Path.Combine(workDirectory, "trigger-queue");
+                await RunMaintainerScriptAsync(package, "prerm", ["remove"], workDirectory, triggerQueue);
+                foreach (var path in package.Files
+                             .OrderByDescending(path => path.Count(character => character == '/')))
+                    if (purge || !package.Conffiles.Contains(path, StringComparer.Ordinal))
+                        DeleteDpmPath(package, path);
+                await RunMaintainerScriptAsync(package, "postrm",
+                    purge ? ["purge"] : ["remove"], workDirectory, triggerQueue);
+
+                if (purge || package.Conffiles.Count == 0)
+                    DeleteDpmPackage(package.Name);
+                else
+                {
+                    var configOnly = package with
+                    {
+                        Status = "config-files",
+                        Files = package.Conffiles,
+                        Scripts = package.Scripts.Where(item => item.Key == "postrm")
+                            .ToDictionary(item => item.Key, item => item.Value, StringComparer.Ordinal)
+                    };
+                    WriteDpmPackage(configOnly);
+                }
+                AddRequestedDpmTriggers(triggerQueue);
+            }
+            finally
+            {
+                if (Directory.Exists(workDirectory))
+                    Directory.Delete(workDirectory, true);
+            }
+        }
+        await ProcessDpmTriggersAsync();
+    }
+
+    private static async Task RunMaintainerScriptAsync(
+        DpmPackageState? package,
+        string scriptName,
+        IReadOnlyList<string> arguments,
+        string workDirectory,
+        string triggerQueue)
+    {
+        if (package is null || !package.Scripts.TryGetValue(scriptName, out var script))
+            return;
+        var scriptsDirectory = Path.Combine(workDirectory, "scripts");
+        Directory.CreateDirectory(scriptsDirectory);
+        var scriptPath = Path.Combine(scriptsDirectory, scriptName);
+        await File.WriteAllTextAsync(scriptPath, script);
+        if (!OperatingSystem.IsWindows())
+            File.SetUnixFileMode(scriptPath, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                             UnixFileMode.UserExecute | UnixFileMode.GroupRead |
+                                             UnixFileMode.GroupExecute | UnixFileMode.OtherRead |
+                                             UnixFileMode.OtherExecute);
+        var compatDirectory = Path.Combine(workDirectory, "compat");
+        Directory.CreateDirectory(compatDirectory);
+        var triggerShim = Path.Combine(compatDirectory, "dpkg-trigger");
+        if (!File.Exists(triggerShim))
+        {
+            await File.WriteAllTextAsync(triggerShim,
+                "#!/bin/sh\nfor arg do\n  case \"$arg\" in --*) ;; *) printf '%s\\n' \"$arg\" >> \"$DPM_TRIGGER_QUEUE\" ;; esac\ndone\n");
+            if (!OperatingSystem.IsWindows())
+                File.SetUnixFileMode(triggerShim, UnixFileMode.UserRead | UnixFileMode.UserWrite |
+                                                   UnixFileMode.UserExecute | UnixFileMode.GroupRead |
+                                                   UnixFileMode.GroupExecute | UnixFileMode.OtherRead |
+                                                   UnixFileMode.OtherExecute);
+        }
+
+        var start = new ProcessStartInfo(scriptPath) { UseShellExecute = false, WorkingDirectory = "/" };
+        foreach (var argument in arguments)
+            start.ArgumentList.Add(argument);
+        start.Environment["PATH"] = compatDirectory + Path.PathSeparator + Environment.GetEnvironmentVariable("PATH");
+        start.Environment["DPM_TRIGGER_QUEUE"] = triggerQueue;
+        start.Environment["DPKG_ADMINDIR"] = DpmStateDirectory;
+        start.Environment["DPKG_ROOT"] = "/";
+        start.Environment["DPKG_MAINTSCRIPT_PACKAGE"] = package.Name;
+        start.Environment["DPKG_MAINTSCRIPT_ARCH"] = package.Architecture;
+        start.Environment["DPKG_MAINTSCRIPT_VERSION"] = package.Version;
+        start.Environment["DPKG_MAINTSCRIPT_NAME"] = scriptName;
+        using var process = Process.Start(start)
+                           ?? throw new InvalidOperationException($"Could not start {package.Name} {scriptName}.");
+        await process.WaitForExitAsync();
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"Maintainer script {scriptName} for {package.Name} failed with exit code {process.ExitCode}.");
+    }
+
+    private static void AddRequestedDpmTriggers(string queuePath)
+    {
+        if (!File.Exists(queuePath))
+            return;
+        ActivateDpmTriggers(File.ReadLines(queuePath)
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0));
+    }
+
+    private static void ActivateDpmTriggers(IEnumerable<string> triggerNames)
+    {
+        var triggers = ReadDpmTriggerState();
+        var states = ReadDpmPackages().Where(package => package.Status == "installed").ToList();
+        foreach (var trigger in triggerNames.Distinct(StringComparer.Ordinal))
+        foreach (var package in states.Where(package =>
+                     package.TriggerInterests.Contains(trigger, StringComparer.Ordinal)))
+        {
+            if (!triggers.Pending.TryGetValue(package.Name, out var pending))
+                triggers.Pending[package.Name] = pending = [];
+            if (!pending.Contains(trigger, StringComparer.Ordinal))
+                pending.Add(trigger);
+        }
+        WriteDpmTriggerState(triggers);
+    }
+
+    private static async Task ProcessDpmTriggersAsync()
+    {
+        for (var pass = 0; pass < 100; pass++)
+        {
+            var triggers = ReadDpmTriggerState();
+            if (triggers.Pending.Count == 0)
+                return;
+            var states = ReadDpmPackages();
+            var processedAny = false;
+            foreach (var pending in triggers.Pending.ToList())
+            {
+                var package = states.FirstOrDefault(state =>
+                    state.Name == pending.Key && state.Status == "installed");
+                if (package is null)
+                {
+                    triggers.Pending.Remove(pending.Key);
+                    continue;
+                }
+
+                var pendingTriggers = pending.Value.ToList();
+                triggers.Pending.Remove(pending.Key);
+                WriteDpmTriggerState(triggers);
+                var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(workDirectory);
+                try
+                {
+                    await RunMaintainerScriptAsync(
+                        package, "postinst", ["triggered", .. pendingTriggers], workDirectory,
+                        Path.Combine(workDirectory, "trigger-queue"));
+                    AddRequestedDpmTriggers(Path.Combine(workDirectory, "trigger-queue"));
+                }
+                catch
+                {
+                    var updated = ReadDpmTriggerState();
+                    updated.Pending[package.Name] = pendingTriggers;
+                    WriteDpmTriggerState(updated);
+                    throw;
+                }
+                finally
+                {
+                    if (Directory.Exists(workDirectory))
+                        Directory.Delete(workDirectory, true);
+                }
+                processedAny = true;
+                triggers = ReadDpmTriggerState();
+            }
+            if (!processedAny)
+                return;
+        }
+        throw new InvalidOperationException("dpm trigger processing exceeded 100 passes.");
+    }
+
+    private static async Task ConfigurePendingDpmPackagesAsync()
+    {
+        var packages = ReadDpmPackages();
+        var incompleteUnpacks = packages.Where(package => package.Status == "half-installed").ToList();
+        if (incompleteUnpacks.Count > 0)
+            throw new InvalidOperationException(
+                $"dpm could not finish unpacking {string.Join(", ", incompleteUnpacks.Select(package => package.Name))}; retry installation or remove the package.");
+        foreach (var package in packages
+                     .Where(package => package.Status is "unpacked" or "half-configured"))
+        {
+            var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(workDirectory);
+            try
+            {
+                await RunMaintainerScriptAsync(
+                    package, "postinst", ["configure"], workDirectory,
+                    Path.Combine(workDirectory, "trigger-queue"));
+                WriteDpmPackage(package with { Status = "installed" });
+                AddRequestedDpmTriggers(Path.Combine(workDirectory, "trigger-queue"));
+            }
+            finally
+            {
+                if (Directory.Exists(workDirectory))
+                    Directory.Delete(workDirectory, true);
+            }
+        }
+        await ProcessDpmTriggersAsync();
+    }
+
+    private static void CheckDpmStatus()
+    {
+        var pendingPackages = ReadDpmPackages()
+            .Where(package => package.Status != "installed" && package.Status != "config-files")
+            .Select(package => $"{package.Name} {package.Version}: {package.Status}")
+            .ToList();
+        var pendingTriggers = ReadDpmTriggerState().Pending;
+        foreach (var package in pendingPackages)
+            Console.WriteLine(package);
+        foreach (var pending in pendingTriggers)
+            Console.WriteLine($"{pending.Key}: triggers pending ({string.Join(", ", pending.Value)})");
+        if (pendingPackages.Count == 0 && pendingTriggers.Count == 0)
+            Console.WriteLine("dpm package database is consistent.");
+    }
+
+    private static void CheckDpmFiles()
+    {
+        var missing = new List<(string Package, string Path)>();
+        var changed = new List<(string Package, string Path)>();
+        foreach (var package in ReadDpmPackages().Where(package => package.Status == "installed"))
+        foreach (var relativePath in package.Files)
+        {
+            var path = Path.Combine("/", relativePath);
+            if (!File.Exists(path) && !Directory.Exists(path) &&
+                new FileInfo(path).LinkTarget is null && new DirectoryInfo(path).LinkTarget is null)
+            {
+                missing.Add((package.Name, path));
+                continue;
+            }
+            if (package.FileHashes.TryGetValue(relativePath, out var expectedHash) &&
+                !string.Equals(GetDpmPathHash(path), expectedHash, StringComparison.Ordinal))
+                changed.Add((package.Name, path));
+        }
+
+        foreach (var (packageName, path) in missing)
+            Console.WriteLine($"missing: {packageName}: {path}");
+        foreach (var (packageName, path) in changed)
+            Console.WriteLine($"changed: {packageName}: {path}");
+        if (missing.Count == 0 && changed.Count == 0)
+            Console.WriteLine("All dpm-managed package files match the recorded state.");
+    }
+
+    private static List<DpmPackageState> ReadDpmPackages()
+    {
+        if (!Directory.Exists(DpmPackageDirectory))
+            return [];
+        return Directory.EnumerateFiles(DpmPackageDirectory, "*.json")
+            .Select(path => JsonSerializer.Deserialize<DpmPackageState>(File.ReadAllText(path))
+                            ?? throw new InvalidDataException($"Invalid dpm package database entry: {path}"))
+            .ToList();
+    }
+
+    private static void WriteDpmPackage(DpmPackageState package)
+    {
+        EnsureValidPackageName(package.Name);
+        Directory.CreateDirectory(DpmPackageDirectory);
+        WriteJsonAtomically(Path.Combine(DpmPackageDirectory, package.Name + ".json"), package);
+    }
+
+    private static void EnsureValidPackageName(string packageName)
+    {
+        if (packageName.Length == 0 ||
+            !(packageName[0] is >= 'a' and <= 'z' or >= '0' and <= '9') ||
+            packageName.Any(character =>
+                !(character is >= 'a' and <= 'z' or >= '0' and <= '9' or '+' or '-' or '.')))
+            throw new InvalidDataException($"Invalid Debian package name: {packageName}");
+    }
+
+    private static void DeleteDpmPackage(string packageName)
+    {
+        var path = Path.Combine(DpmPackageDirectory, packageName + ".json");
+        if (File.Exists(path))
+            File.Delete(path);
+    }
+
+    private static DpmTriggerState ReadDpmTriggerState()
+    {
+        if (!File.Exists(DpmTriggerFile))
+            return new DpmTriggerState(new Dictionary<string, List<string>>(StringComparer.Ordinal));
+        return JsonSerializer.Deserialize<DpmTriggerState>(File.ReadAllText(DpmTriggerFile))
+               ?? throw new InvalidDataException("Invalid dpm trigger database.");
+    }
+
+    private static void WriteDpmTriggerState(DpmTriggerState triggers)
+    {
+        Directory.CreateDirectory(DpmStateDirectory);
+        WriteJsonAtomically(DpmTriggerFile, triggers);
+    }
+
+    private static void WriteJsonAtomically<T>(string path, T value)
+    {
+        var temporaryFile = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(temporaryFile, JsonSerializer.Serialize(value));
+            File.Move(temporaryFile, path, true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryFile))
+                File.Delete(temporaryFile);
         }
     }
 
@@ -1213,6 +2369,51 @@ internal static class Program
                            !removed.Contains(name) &&
                            !reachable.Contains(name))
             .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static List<string> OrderPackagesForRemoval(
+        IReadOnlyDictionary<string, InstalledPackage> installed,
+        IReadOnlySet<string> removed)
+    {
+        var index = BuildInstalledDependencyIndex(installed);
+        var dependentsByDependency = removed.ToDictionary(
+            name => name,
+            _ => new HashSet<string>(StringComparer.Ordinal),
+            StringComparer.Ordinal);
+        foreach (var packageName in removed)
+        {
+            if (!installed.TryGetValue(packageName, out var package))
+                continue;
+            foreach (var dependency in ParseDependencyGroups(package.PreDepends)
+                         .Concat(ParseDependencyGroups(package.Depends)))
+            foreach (var candidate in dependency
+                         .SelectMany(alternative => GetInstalledCandidates(index, alternative))
+                         .DistinctBy(candidate => candidate.Key))
+            {
+                if (candidate.Key != packageName &&
+                    removed.Contains(candidate.Key) &&
+                    dependency.Any(alternative =>
+                        InstalledPackageSatisfies(candidate.Value, candidate.Key, alternative)))
+                    dependentsByDependency[candidate.Key].Add(packageName);
+            }
+        }
+
+        var states = new Dictionary<string, byte>(StringComparer.Ordinal);
+        var ordered = new List<string>(removed.Count);
+        foreach (var packageName in removed.Order(StringComparer.Ordinal))
+            Visit(packageName);
+        return ordered;
+
+        void Visit(string packageName)
+        {
+            if (states.TryGetValue(packageName, out var state) && state != 0)
+                return;
+            states[packageName] = 1;
+            foreach (var dependent in dependentsByDependency[packageName].Order(StringComparer.Ordinal))
+                Visit(dependent);
+            states[packageName] = 2;
+            ordered.Add(packageName);
+        }
     }
 
     private static List<string> FindBlockingDependents(
@@ -1786,10 +2987,12 @@ internal static class Program
 
     private static async Task DownloadAsync(string packageName)
     {
-        var candidate = SelectCandidate(packageName);
-        if (candidate is null) throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
-        var file = (await DownloadPackagesAsync([candidate])).Single();
-        Console.WriteLine($"已下载: {file}");
+        var candidates = SelectCandidates(packageName);
+        if (candidates.Count == 0)
+            throw new InvalidOperationException($"Package '{packageName}' was not found in the package indexes.");
+        var files = await DownloadPackagesAsync(candidates);
+        foreach (var file in files)
+            Console.WriteLine($"已下载: {file}");
     }
 
     private static void ClearPackageCache()
@@ -1981,6 +3184,14 @@ internal static class Program
     private static PackageRecord? SelectCandidate(string name) =>
         SelectNewest(LoadPackages().Where(p => PackageNameMatches(p.Name, name)));
 
+    private static List<PackageRecord> SelectCandidates(string pattern) =>
+        LoadPackages()
+            .Where(package => MatchesPackageName(package.Name, pattern))
+            .GroupBy(package => package.Name, StringComparer.Ordinal)
+            .Select(group => SelectNewest(group)!)
+            .OrderBy(package => package.Name, StringComparer.Ordinal)
+            .ToList();
+
     private static PackageRecord? SelectNewest(IEnumerable<PackageRecord> packages)
     {
         PackageRecord? selected = null;
@@ -2159,7 +3370,9 @@ internal static class Program
     private static void Search(string term)
     {
         var matches = LoadPackages()
-            .Where(p => p.Name.Contains(term, StringComparison.OrdinalIgnoreCase) ||
+            .Where(p => (HasWildcard(term)
+                            ? MatchesPackageName(p.Name, term)
+                            : p.Name.Contains(term, StringComparison.OrdinalIgnoreCase)) ||
                         p.Description.Contains(term, StringComparison.OrdinalIgnoreCase))
             .GroupBy(p => p.Name, StringComparer.Ordinal)
             .Select(group => SelectNewest(group)!)
@@ -2173,6 +3386,25 @@ internal static class Program
 
     private static async Task<Dictionary<string, InstalledPackage>> GetInstalledAsync()
     {
+        var installed = await GetSystemInstalledAsync();
+        foreach (var package in ReadDpmPackages().Where(package => package.Status == "installed"))
+        {
+            if (installed.Keys.Any(name => PackageNameMatches(name, package.Name)))
+                continue;
+            installed[package.Name] = new InstalledPackage(
+                package.Version,
+                package.Provides,
+                package.PreDepends,
+                package.Depends,
+                package.Recommends,
+                true,
+                package);
+        }
+        return installed;
+    }
+
+    private static async Task<Dictionary<string, InstalledPackage>> GetSystemInstalledAsync()
+    {
         var result = await RunProcessAsync("dpkg-query",
             ["-W", "-f=${binary:Package}\\t${Version}\\t${db:Status-Status}\\t${Provides}\\t${Pre-Depends}\\t${Depends}\\t${Recommends}\\n"]);
         if (result.ExitCode != 0) throw new InvalidOperationException("Could not query installed packages.");
@@ -2184,6 +3416,34 @@ internal static class Program
                 installed[fields[0]] = new InstalledPackage(fields[1], fields[3], fields[4], fields[5], fields[6]);
         }
         return installed;
+    }
+
+    private static async Task<List<string>> GetSystemConfigFilesAsync()
+    {
+        var result = await RunProcessAsync(
+            "dpkg-query",
+            ["-W", "-f=${binary:Package}\\t${db:Status-Status}\\n"]);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException("Could not query system package configuration state.");
+        return result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Split('\t', 2))
+            .Where(fields => fields.Length == 2 && fields[1] == "config-files")
+            .Select(fields => fields[0])
+            .ToList();
+    }
+
+    private static async Task<List<string>> GetSystemManagedPackageNamesAsync()
+    {
+        var result = await RunProcessAsync(
+            "dpkg-query",
+            ["-W", "-f=${binary:Package}\\t${db:Status-Status}\\n"]);
+        if (result.ExitCode != 0)
+            throw new InvalidOperationException("Could not query system package ownership.");
+        return result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => line.Split('\t', 2))
+            .Where(fields => fields.Length == 2 && fields[1] != "not-installed")
+            .Select(fields => fields[0])
+            .ToList();
     }
 
     private static async Task RunDpkgAsync(
@@ -2437,6 +3697,55 @@ internal static class Program
         indexed.Equals(requested, StringComparison.Ordinal) ||
         indexed.StartsWith(requested + ":", StringComparison.Ordinal);
 
+    private static bool MatchesPackageName(string indexed, string requested)
+    {
+        if (!HasWildcard(requested))
+            return PackageNameMatches(indexed, requested);
+
+        var candidate = requested.Contains(':')
+            ? indexed
+            : indexed.Split(':', 2)[0];
+        return WildcardMatch(candidate, requested);
+    }
+
+    private static bool HasWildcard(string pattern) =>
+        pattern.Contains('*') ||
+        pattern.Contains('?');
+
+    private static bool WildcardMatch(string value, string pattern)
+    {
+        var valueIndex = 0;
+        var patternIndex = 0;
+        var starIndex = -1;
+        var retryValueIndex = -1;
+
+        while (valueIndex < value.Length)
+        {
+            if (patternIndex < pattern.Length &&
+                (pattern[patternIndex] == '?' || pattern[patternIndex] == value[valueIndex]))
+            {
+                patternIndex++;
+                valueIndex++;
+            }
+            else if (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+            {
+                starIndex = patternIndex++;
+                retryValueIndex = valueIndex;
+            }
+            else if (starIndex >= 0)
+            {
+                patternIndex = starIndex + 1;
+                valueIndex = ++retryValueIndex;
+            }
+            else
+                return false;
+        }
+
+        while (patternIndex < pattern.Length && pattern[patternIndex] == '*')
+            patternIndex++;
+        return patternIndex == pattern.Length;
+    }
+
     private static string EnsureTrailingSlash(string value) => value.EndsWith('/') ? value : value + "/";
 
     private static uint GetEffectiveUid() => geteuid();
@@ -2575,7 +3884,27 @@ internal static class Program
         string Provides,
         string PreDepends,
         string Depends,
-        string Recommends);
+        string Recommends,
+        bool IsDpmManaged = false,
+        DpmPackageState? DpmState = null);
+    private sealed record DpmPackageState(
+        string Name,
+        string Version,
+        string Architecture,
+        string Status,
+        string Provides,
+        string PreDepends,
+        string Depends,
+        string Recommends,
+        List<string> Files,
+        List<string> Directories,
+        List<string> Conffiles,
+        Dictionary<string, string> ConffileHashes,
+        Dictionary<string, string> FileHashes,
+        Dictionary<string, string> Scripts,
+        List<string> TriggerInterests,
+        List<string> TriggerActivations);
+    private sealed record DpmTriggerState(Dictionary<string, List<string>> Pending);
     private sealed record InstalledDependencyIndex(
         IReadOnlyDictionary<string, List<KeyValuePair<string, InstalledPackage>>> ByName,
         IReadOnlyDictionary<string, List<KeyValuePair<string, InstalledPackage>>> ByProvide);

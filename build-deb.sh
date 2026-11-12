@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-VERSION=${VERSION:-0.1.44}
+VERSION=${VERSION:-0.1.45}
 ARCH=${ARCH:-arm64}
 OUTPUT="$ROOT/dist"
 STAGE="$ROOT/.package-root"
@@ -52,7 +52,7 @@ Section: admin
 Priority: optional
 Architecture: $ARCH
 Maintainer: dpm maintainers
-Depends: libc6, dpkg, gpgv, xz-utils, gzip
+Depends: libc6, dpkg, gpgv, xz-utils, gzip, bzip2, zstd, lz4
 Description: lightweight Debian package manager
  A C# package manager for signed Debian repositories.
 EOF

@@ -1,10 +1,13 @@
 # dpm
 
-`dpm` is a small C# command-line front end for Debian `.deb` repositories. It
-downloads repository indexes and package archives itself using .NET HTTP APIs;
-`dpkg` performs package installation/removal and integrity checks. Repository
-metadata is authenticated with `gpgv`, and downloaded indexes and packages are
-checked against SHA-256 hashes from the signed Release metadata.
+`dpm` is a C# package manager for Debian `.deb` repositories. It downloads
+repository indexes and package archives itself using .NET HTTP APIs. Packages
+already registered as installed by the system package manager are installed or
+removed through `dpkg`; packages installed by dpm are extracted and managed by
+dpm, including their maintainer scripts, package database, file lists, and
+triggers. Repository metadata is authenticated with `gpgv`, and downloaded
+indexes and packages are checked against SHA-256 hashes from signed Release
+metadata.
 
 ## Build and install
 
@@ -13,7 +16,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.44_arm64.deb
+sudo dpkg -i dist/dpm_0.1.45_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -28,11 +31,12 @@ The package includes the .NET runtime and an optional Tsinghua mirror example
 at `/usr/share/doc/dpm/examples/tuna.list`; it does not enable any repository
 source by default. Configure your own `.list` file in
 `/etc/dpm/sources.list.d/` before running repository operations. At runtime,
-`dpkg`, `gpgv`, `xz-utils`, and `gzip` are Debian package dependencies. Every
+`dpkg`, `gpgv`, `xz-utils`, `gzip`, `bzip2`, `zstd`, and `lz4` are Debian package
+dependencies. Every
 invocation requires effective UID 0. `dpm` never invokes `sudo`, `su`, `pkexec`,
 or PolicyKit and does not attempt to elevate privileges.
 Operational commands take an exclusive `/run/lock/dpm.lock` lock so concurrent
-dpm processes cannot race on package indexes, caches, or dpkg operations. The
+dpm processes cannot race on package indexes, caches, or package operations. The
 kernel releases the lock automatically when the process exits.
 
 ## Sources
@@ -77,24 +81,30 @@ in `/var/cache/dpm/deb`.
 dpm update
 dpm up                    # alias for update
 dpm check-sources         # checks configured sources against signed Release metadata
-dpm install PACKAGE [PACKAGE ...] # refreshes indexes, then installs all requested packages
+dpm install PACKAGE|PATTERN [PACKAGE|PATTERN ...] # refreshes indexes, then installs all matches
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm fix                   # repairs missing dependencies and configures pending packages
 dpm -f                    # alias for fix
 dpm -fix                  # alias for fix
 dpm -f install PACKAGE... # repairs dependencies and installs requested packages
-dpm reinstall PACKAGE     # reinstalls the installed version from the repositories
-dpm remove PACKAGE [PACKAGE ...]
-dpm uninstall PACKAGE [PACKAGE ...] # alias for remove
-dpm purge PACKAGE [PACKAGE ...] # removes packages and their configuration files
-dpm upgrade [PACKAGE]
+dpm reinstall PACKAGE|PATTERN
+dpm remove PACKAGE|PATTERN [...]
+dpm uninstall PACKAGE|PATTERN [...] # alias for remove
+dpm purge PACKAGE|PATTERN [...] # removes packages and their configuration files
+dpm upgrade [PACKAGE|PATTERN]
 dpm upgrade-dpm           # upgrades dpm from the latest GitHub release
-dpm check                 # dpkg --audit
-dpm check-filesystem      # dpkg --verify
-dpm download PACKAGE
+dpm check                 # audit dpkg and dpm package states
+dpm check-filesystem      # verify dpkg and dpm package files
+dpm download PACKAGE|PATTERN
 dpm clear                 # clear downloaded .deb cache (keeps indexes)
 dpm search TERM
 ```
+
+Package-name patterns support `*` (any sequence) and `?` (one character) in
+`install`, `reinstall`, `remove`, `purge`, `upgrade`, `download`, and `search`.
+For example, `dpm install 'python3-*'` selects the newest indexed version of
+each matching package. Quote patterns so the shell passes them to `dpm`
+unchanged. `search` also continues to match terms in package descriptions.
 
 `install`, `reinstall`, and `upgrade` resolve `Pre-Depends`, `Depends`, and
 `Recommends` recursively, including version constraints, alternative
@@ -102,8 +112,12 @@ dependencies, and virtual packages declared by `Provides`. This follows apt's
 default of installing recommended packages; `Suggests` are not installed
 automatically. Already-installed satisfying packages are reused; missing
 dependencies are selected from the signed package indexes, included in the
-confirmation list, downloaded, and passed to `dpkg` together with the requested
-packages.
+confirmation list, downloaded, and installed by the backend that owns each
+package.
+Packages not already registered as installed by dpkg are installed directly by
+dpm. Their state and owned-file lists are stored under
+`/var/lib/dpm/packages/`; files owned by dpkg or another dpm package are not
+overwritten.
 Already-installed metapackages encountered in this dependency tree are also
 expanded, so rerunning an install can fill in missing recommended packages
 without reinstalling the metapackage itself.
@@ -115,23 +129,33 @@ responsive.
 `fix`, `-f`, `-fix`, and `--fix-broken` scan installed packages for unsatisfied
 `Pre-Depends` and `Depends`, select available providers from the configured
 repositories, and include them in the normal reviewed installation plan. They
-also run `dpkg --configure --pending` when dpkg reports packages awaiting
-configuration. Unavailable or conflicting repairs are reported rather than
-bypassing dependency safety checks.
+also configure pending dpkg-managed packages and retry pending dpm maintainer
+scripts and triggers. Unavailable or conflicting repairs are reported rather
+than bypassing dependency safety checks.
 
 `upgrade-dpm` compares the installed version with the latest stable GitHub
 release and exits only when they match. Otherwise, GitHub's release is treated
 as authoritative: dpm displays the publisher and release notes and asks before
 downloading. After confirmation it verifies the package SHA256 digest and
-Debian metadata, then installs it with dpkg. If the installed version is newer,
-dpkg is explicitly allowed to downgrade to the GitHub release. When the
+Debian metadata, then uses dpkg or its own installer according to package
+ownership. If the installed version is newer, the selected backend is allowed
+to downgrade to the GitHub release. When the
 effective `LC_ALL`, `LC_MESSAGES`, or `LANG` locale is `zh_CN.UTF-8`, the GitHub
 download URL is fetched through `https://gh-proxy.org/`.
 
-`install` also accepts a local `.deb` path. Its package metadata is read with
-`dpkg-deb`; the package is included in the normal confirmation and installation
-plan, while any missing dependencies are resolved from the configured indexes.
-The local package architecture must match the system or be `all`.
+`install` also accepts a local `.deb` path. dpm reads its Debian archive and
+control metadata directly; the package is included in the normal confirmation
+and installation plan, while any missing dependencies are resolved from the
+configured indexes. The local package architecture must match the system or be
+`all`.
+
+Packages installed by dpm are recorded only in dpm's database and are not
+registered in dpkg's database, so APT/dpkg do not manage or report them. When a
+package is already dpkg-managed, dpm keeps using dpkg for that package. dpm
+maintainer scripts run as root with the usual `DPKG_MAINTSCRIPT_*` variables;
+`dpkg-trigger` requests are routed to dpm's trigger database. Scripts that
+require dpm-installed packages to appear in dpkg's database are not compatible
+with dpm-managed installation.
 
 `reinstall` requires the package to be installed and its exact installed version
 to be available in the configured repositories. It reinstalls that version
@@ -160,18 +184,12 @@ input defaults to cancellation. Use `-y`/`--yes` to automatically confirm or
 `-n`/`--no` to automatically cancel confirmation prompts; either option can
 appear before or after the command. They cannot be combined.
 
-During install, reinstall, upgrade, and removal, the progress display tracks
-only packages in the current transaction, based on dpkg's machine-readable
-status events. Trigger processing and unrelated packages do not advance it.
-The terminal display updates in place; redirected output emits only a final
-summary. Status events are read from a dedicated descriptor so maintainer
-script output continues to use the terminal normally. If an install fails,
-dpm retries `dpkg --configure --pending` once and verifies that every planned
-package reached its requested version before treating the transaction as
-recovered.
-dpkg does not report a byte-level percentage for unpacking/configuring a single
-package, so the bar can remain still while that package is being processed; it
-does not invent intermediate progress.
+During install, reinstall, upgrade, and removal, dpkg-managed packages use
+dpkg's machine-readable status events; dpm-managed packages are processed in
+dependency order by dpm. Trigger processing and unrelated packages do not
+advance dpkg's progress. Maintainer scripts continue to use the terminal
+normally. Failed dpm maintainer scripts remain in the dpm package database for
+repair with `dpm fix`.
 
 During `update`, the index progress bar advances only after each configured
 component index has been downloaded, signature/hash-verified, and installed in
