@@ -1341,16 +1341,24 @@ internal static class Program
         Directory.CreateDirectory(DpmPackageDirectory);
         var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workDirectory);
+        var progressStarted = false;
+        var progressCompleted = false;
+        var lastReportedPercent = -1;
+        var lastReportedStage = "";
         try
         {
+            ReportProgress(0, "准备");
             var (controlArchive, dataArchive) = ExtractDebMembers(packageFile, workDirectory);
 
+            ReportProgress(3, "解压控制信息");
             var controlTar = await DecompressArchiveAsync(controlArchive, workDirectory);
+            ReportProgress(5, "解压数据归档");
             var dataTar = await DecompressArchiveAsync(dataArchive, workDirectory);
             var controlDirectory = Path.Combine(workDirectory, "control");
             var dataDirectory = Path.Combine(workDirectory, "data");
             Directory.CreateDirectory(controlDirectory);
             await ExtractTarToDirectoryAsync(controlTar, controlDirectory);
+            ReportProgress(10, "读取软件包信息");
 
             var controlText = ReadControlFile(controlDirectory, "control")
                               ?? throw new InvalidDataException($"Package '{expected.Name}' has no control file.");
@@ -1368,7 +1376,13 @@ internal static class Program
                 throw new InvalidDataException(
                     $"Package '{packageName}' is for {architecture}, but this system is {systemArchitecture}.");
 
-            var (paths, directories) = await ExtractTarToDirectoryAsync(dataTar, dataDirectory);
+            var (paths, directories) = await ExtractTarToDirectoryAsync(
+                dataTar,
+                dataDirectory,
+                (completed, total) => ReportProgress(
+                    10 + (int)(completed * 15d / Math.Max(1L, total)),
+                    "解包"));
+            ReportProgress(25, "运行安装前脚本");
 
             var states = ReadDpmPackages();
             var previous = states.FirstOrDefault(package => package.Name == packageName);
@@ -1405,10 +1419,17 @@ internal static class Program
                 workDirectory, triggerQueue);
 
             WriteDpmPackage(newState with { Status = "half-installed" });
-            await CopyDpmPackageFilesAsync(dataDirectory, newState, previous);
+            await CopyDpmPackageFilesAsync(
+                dataDirectory,
+                newState,
+                previous,
+                (completed, total) => ReportProgress(
+                    25 + (int)(completed * 60d / Math.Max(1, total)),
+                    "安装文件"));
             if (previous is not null)
                 RemoveObsoleteDpmFiles(previous, newState);
 
+            ReportProgress(88, "运行配置脚本");
             newState = newState with { Status = "unpacked" };
             WriteDpmPackage(newState);
             await RunMaintainerScriptAsync(previous, "postrm", ["upgrade", version], workDirectory, triggerQueue);
@@ -1421,11 +1442,26 @@ internal static class Program
             WriteDpmPackage(newState);
             AddRequestedDpmTriggers(triggerQueue);
             ActivateDpmTriggers(newState.TriggerActivations);
+            ReportProgress(100, "完成", true);
         }
         finally
         {
             if (Directory.Exists(workDirectory))
                 Directory.Delete(workDirectory, true);
+            if (progressStarted && !progressCompleted && !Console.IsOutputRedirected)
+                Console.WriteLine();
+        }
+
+        void ReportProgress(int percent, string stage, bool complete = false)
+        {
+            progressStarted = true;
+            progressCompleted = complete;
+            if (!complete && percent == lastReportedPercent &&
+                string.Equals(stage, lastReportedStage, StringComparison.Ordinal))
+                return;
+            lastReportedPercent = percent;
+            lastReportedStage = stage;
+            RenderDpmInstallProgress(expected.Name, percent, stage, complete);
         }
     }
 
@@ -1558,7 +1594,8 @@ internal static class Program
 
     private static async Task<(List<string> Paths, List<string> Directories)> ExtractTarToDirectoryAsync(
         string tarPath,
-        string destinationDirectory)
+        string destinationDirectory,
+        Action<long, long>? progress = null)
     {
         var paths = new List<string>();
         var directories = new List<string>();
@@ -1608,6 +1645,7 @@ internal static class Program
                     throw new InvalidDataException(
                         $"Package contains an unsupported tar entry type: {entry.EntryType} ({entry.Name})");
             }
+            progress?.Invoke(stream.Position, stream.Length);
 
             if (!paths.Contains(path, StringComparer.Ordinal))
                 paths.Add(path);
@@ -1782,11 +1820,14 @@ internal static class Program
     private static async Task CopyDpmPackageFilesAsync(
         string sourceDirectory,
         DpmPackageState package,
-        DpmPackageState? previous)
+        DpmPackageState? previous,
+        Action<int, int>? progress = null)
     {
         var oldFiles = previous?.Files.ToHashSet(StringComparer.Ordinal) ?? [];
         var conffiles = package.Conffiles.ToHashSet(StringComparer.Ordinal);
         var createdDirectories = new List<string>();
+        var completedFiles = 0;
+        var totalFiles = package.Files.Count;
         foreach (var relativePath in package.Files
                      .ToList()
                      .OrderBy(path => path.Count(character => character == '/'))
@@ -1813,6 +1854,7 @@ internal static class Program
                 Directory.CreateDirectory(targetPath);
                 if (!targetExisted)
                     createdDirectories.Add(relativePath);
+                ReportFileProgress();
                 continue;
             }
 
@@ -1840,6 +1882,7 @@ internal static class Program
                     package.Files.Add(newRelativePath);
                 package.FileHashes[newRelativePath] = await GetDpmPathHashAsync(newPath);
                 package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
+                ReportFileProgress();
                 continue;
             }
             if (targetExists && !oldFiles.Contains(relativePath))
@@ -1856,6 +1899,7 @@ internal static class Program
                 File.Delete(targetPath);
             await CopyPackageFileAsync(sourcePath, targetPath, isSymlink);
             package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
+            ReportFileProgress();
         }
 
         if (!OperatingSystem.IsWindows())
@@ -1872,6 +1916,12 @@ internal static class Program
             var sourcePath = Path.Combine(sourceDirectory, conffile);
             if (File.Exists(sourcePath))
                 package.ConffileHashes[conffile] = await GetFileSha256Async(sourcePath);
+        }
+
+        void ReportFileProgress()
+        {
+            completedFiles++;
+            progress?.Invoke(completedFiles, totalFiles);
         }
     }
 
@@ -3578,6 +3628,29 @@ internal static class Program
             Console.Write($"\r{message}\u001b[K");
 
         if (forceComplete || percent == 100)
+            Console.WriteLine();
+    }
+
+    private static void RenderDpmInstallProgress(
+        string package,
+        int percent,
+        string stage,
+        bool complete = false)
+    {
+        percent = Math.Clamp(percent, 0, 100);
+        const int width = 16;
+        var filled = percent * width / 100;
+        var bar = new string('#', filled) + new string('-', width - filled);
+        var message = $"安装 {package} [{bar}] {percent,3}% {stage}";
+        if (Console.IsOutputRedirected)
+        {
+            if (complete)
+                Console.WriteLine(message);
+        }
+        else
+            Console.Write($"\r{message}\u001b[K");
+
+        if (complete)
             Console.WriteLine();
     }
 
