@@ -16,7 +16,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.48_arm64.deb
+sudo dpkg -i dist/dpm_0.1.49_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -122,6 +122,9 @@ automatically. Already-installed satisfying packages are reused; missing
 dependencies are selected from the signed package indexes, included in the
 confirmation list, downloaded, and installed by the backend that owns each
 package.
+dpkg-managed transactions use `dpkg --auto-deconfigure` so packages that
+declare versioned `Breaks`/`Replaces` can be upgraded together with their
+replacement packages; dpm then configures the pending packages.
 Packages not already registered as installed by dpkg are installed directly by
 dpm. Their state and owned-file lists are stored under
 `/var/lib/dpm/packages/`; files owned by dpkg or another dpm package are not

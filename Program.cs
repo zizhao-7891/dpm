@@ -1301,7 +1301,7 @@ internal static class Program
         try
         {
             await RunDpkgAsync(
-                ["--install", .. files],
+                ["--auto-deconfigure", "--install", .. files],
                 files.Count,
                 true,
                 packages.Select(package => package.Name).ToHashSet(StringComparer.Ordinal));
