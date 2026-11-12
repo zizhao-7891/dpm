@@ -1461,7 +1461,7 @@ internal static class Program
                 return;
             lastReportedPercent = percent;
             lastReportedStage = stage;
-            RenderDpmInstallProgress(expected.Name, percent, stage, complete);
+            RenderDpmPackageProgress("安装", expected.Name, percent, stage, complete);
         }
     }
 
@@ -2063,14 +2063,27 @@ internal static class Program
                           ?? throw new InvalidOperationException($"dpm package state is missing for '{packageName}'.");
             var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(workDirectory);
+            var progressStarted = false;
+            var progressCompleted = false;
+            var lastReportedPercent = -1;
+            var lastReportedStage = "";
             try
             {
+                ReportProgress(0, "准备");
                 var triggerQueue = Path.Combine(workDirectory, "trigger-queue");
                 await RunMaintainerScriptAsync(package, "prerm", ["remove"], workDirectory, triggerQueue);
-                foreach (var path in package.Files
-                             .OrderByDescending(path => path.Count(character => character == '/')))
+                ReportProgress(10, "运行卸载前脚本");
+                var files = package.Files
+                    .OrderByDescending(path => path.Count(character => character == '/'))
+                    .ToList();
+                for (var index = 0; index < files.Count; index++)
+                {
+                    var path = files[index];
                     if (purge || !package.Conffiles.Contains(path, StringComparer.Ordinal))
                         DeleteDpmPath(package, path);
+                    ReportProgress(10 + (int)((index + 1) * 75d / Math.Max(1, files.Count)), "删除文件");
+                }
+                ReportProgress(88, "运行卸载脚本");
                 await RunMaintainerScriptAsync(package, "postrm",
                     purge ? ["purge"] : ["remove"], workDirectory, triggerQueue);
 
@@ -2088,14 +2101,35 @@ internal static class Program
                     WriteDpmPackage(configOnly);
                 }
                 AddRequestedDpmTriggers(triggerQueue);
+                ReportProgress(95, "处理触发器");
+                await ProcessDpmTriggersAsync();
+                ReportProgress(100, purge ? "已彻底清除" : "已卸载", true);
+
+                void ReportProgress(int percent, string stage, bool complete = false)
+                {
+                    progressStarted = true;
+                    progressCompleted = complete;
+                    if (!complete && percent == lastReportedPercent &&
+                        string.Equals(stage, lastReportedStage, StringComparison.Ordinal))
+                        return;
+                    lastReportedPercent = percent;
+                    lastReportedStage = stage;
+                    RenderDpmPackageProgress(
+                        purge ? "清除" : "卸载",
+                        package.Name,
+                        percent,
+                        stage,
+                        complete);
+                }
             }
             finally
             {
                 if (Directory.Exists(workDirectory))
                     Directory.Delete(workDirectory, true);
+                if (progressStarted && !progressCompleted && !Console.IsOutputRedirected)
+                    Console.WriteLine();
             }
         }
-        await ProcessDpmTriggersAsync();
     }
 
     private static async Task RunMaintainerScriptAsync(
@@ -3631,7 +3665,8 @@ internal static class Program
             Console.WriteLine();
     }
 
-    private static void RenderDpmInstallProgress(
+    private static void RenderDpmPackageProgress(
+        string action,
         string package,
         int percent,
         string stage,
@@ -3641,7 +3676,7 @@ internal static class Program
         const int width = 16;
         var filled = percent * width / 100;
         var bar = new string('#', filled) + new string('-', width - filled);
-        var message = $"安装 {package} [{bar}] {percent,3}% {stage}";
+        var message = $"{action} {package} [{bar}] {percent,3}% {stage}";
         if (Console.IsOutputRedirected)
         {
             if (complete)
