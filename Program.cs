@@ -1257,43 +1257,67 @@ internal static class Program
         if (files.Count != packages.Count)
             throw new InvalidOperationException("The downloaded package list does not match the installation plan.");
 
-        var systemManagedPackages = await GetSystemManagedPackageNamesAsync();
+        if (packages.Count == 0)
+            return;
+
+        var progress = new PackageInstallProgress(packages);
+        progress.Start();
         var dpmInstallCount = 0;
-        var index = 0;
-        while (index < packages.Count)
+        try
         {
-            var systemManaged = systemManagedPackages.Any(name =>
-                PackageNameMatches(name, packages[index].Name));
-            var groupStart = index++;
+            var systemManagedPackages = await GetSystemManagedPackageNamesAsync();
+            var index = 0;
             while (index < packages.Count)
             {
-                var nextSystemManaged = systemManagedPackages.Any(name =>
+                var systemManaged = systemManagedPackages.Any(name =>
                     PackageNameMatches(name, packages[index].Name));
-                if (nextSystemManaged != systemManaged)
-                    break;
-                index++;
-            }
-            var groupFiles = files.Skip(groupStart).Take(index - groupStart).ToArray();
-            var groupPackages = packages.Skip(groupStart).Take(index - groupStart).ToArray();
-            if (systemManaged)
-                await InstallSystemPackagesAsync(groupFiles, groupPackages);
-            else
-            {
-                for (var item = 0; item < groupPackages.Length; item++)
+                var groupStart = index++;
+                while (index < packages.Count)
                 {
-                    await InstallDpmPackageAsync(groupFiles[item], groupPackages[item]);
-                    dpmInstallCount++;
+                    var nextSystemManaged = systemManagedPackages.Any(name =>
+                        PackageNameMatches(name, packages[index].Name));
+                    if (nextSystemManaged != systemManaged)
+                        break;
+                    index++;
+                }
+                var groupFiles = files.Skip(groupStart).Take(index - groupStart).ToArray();
+                var groupPackages = packages.Skip(groupStart).Take(index - groupStart).ToArray();
+                if (systemManaged)
+                    await InstallSystemPackagesAsync(
+                        groupFiles,
+                        groupPackages,
+                        progress.CompletePackage,
+                        progress.SetCurrentPackage);
+                else
+                {
+                    for (var item = 0; item < groupPackages.Length; item++)
+                    {
+                        progress.SetCurrentPackage(groupPackages[item].Name);
+                        await InstallDpmPackageAsync(groupFiles[item], groupPackages[item]);
+                        dpmInstallCount++;
+                        progress.CompletePackage(groupPackages[item].Name);
+                    }
                 }
             }
-        }
 
-        if (dpmInstallCount > 0)
-            await ProcessDpmTriggersAsync();
+            if (dpmInstallCount > 0)
+            {
+                progress.SetStage("处理触发器");
+                await ProcessDpmTriggersAsync();
+            }
+            progress.Complete();
+        }
+        finally
+        {
+            progress.End();
+        }
     }
 
     private static async Task InstallSystemPackagesAsync(
         IReadOnlyList<string> files,
-        IReadOnlyList<PackageRecord> packages)
+        IReadOnlyList<PackageRecord> packages,
+        Action<string> onPackageCompleted,
+        Action<string> onPackageStarted)
     {
         for (var index = 0; index < packages.Count; index++)
             await ValidateSystemPackageFilesAsync(files[index], packages[index]);
@@ -1304,14 +1328,22 @@ internal static class Program
                 ["--auto-deconfigure", "--install", .. files],
                 files.Count,
                 true,
-                packages.Select(package => package.Name).ToHashSet(StringComparer.Ordinal));
+                packages.Select(package => package.Name).ToHashSet(StringComparer.Ordinal),
+                onPackageCompleted,
+                onPackageStarted);
         }
         catch (InvalidOperationException installError)
         {
             Console.Error.WriteLine("警告: dpkg 安装未完全成功，正在重试配置待配置的软件包。");
             try
             {
-                await RunDpkgAsync(["--configure", "--pending"]);
+                await RunDpkgAsync(
+                    ["--configure", "--pending"],
+                    packages.Count,
+                    true,
+                    packages.Select(package => package.Name).ToHashSet(StringComparer.Ordinal),
+                    onPackageCompleted,
+                    onPackageStarted);
             }
             catch (InvalidOperationException configureError)
             {
@@ -1346,24 +1378,16 @@ internal static class Program
         Directory.CreateDirectory(DpmPackageDirectory);
         var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(workDirectory);
-        var progressStarted = false;
-        var progressCompleted = false;
-        var lastReportedPercent = -1;
-        var lastReportedStage = "";
         try
         {
-            ReportProgress(0, "准备");
             var (controlArchive, dataArchive) = ExtractDebMembers(packageFile, workDirectory);
 
-            ReportProgress(3, "解压控制信息");
             var controlTar = await DecompressArchiveAsync(controlArchive, workDirectory);
-            ReportProgress(5, "解压数据归档");
             var dataTar = await DecompressArchiveAsync(dataArchive, workDirectory);
             var controlDirectory = Path.Combine(workDirectory, "control");
             var dataDirectory = Path.Combine(workDirectory, "data");
             Directory.CreateDirectory(controlDirectory);
             await ExtractTarToDirectoryAsync(controlTar, controlDirectory);
-            ReportProgress(10, "读取软件包信息");
 
             var controlText = ReadControlFile(controlDirectory, "control")
                               ?? throw new InvalidDataException($"Package '{expected.Name}' has no control file.");
@@ -1381,13 +1405,7 @@ internal static class Program
                 throw new InvalidDataException(
                     $"Package '{packageName}' is for {architecture}, but this system is {systemArchitecture}.");
 
-            var (paths, directories) = await ExtractTarToDirectoryAsync(
-                dataTar,
-                dataDirectory,
-                (completed, total) => ReportProgress(
-                    10 + (int)(completed * 15d / Math.Max(1L, total)),
-                    "解包"));
-            ReportProgress(25, "运行安装前脚本");
+            var (paths, directories) = await ExtractTarToDirectoryAsync(dataTar, dataDirectory);
 
             var states = ReadDpmPackages();
             var previous = states.FirstOrDefault(package => package.Name == packageName);
@@ -1424,17 +1442,10 @@ internal static class Program
                 workDirectory, triggerQueue);
 
             WriteDpmPackage(newState with { Status = "half-installed" });
-            await CopyDpmPackageFilesAsync(
-                dataDirectory,
-                newState,
-                previous,
-                (completed, total) => ReportProgress(
-                    25 + (int)(completed * 60d / Math.Max(1, total)),
-                    "安装文件"));
+            await CopyDpmPackageFilesAsync(dataDirectory, newState, previous);
             if (previous is not null)
                 RemoveObsoleteDpmFiles(previous, newState);
 
-            ReportProgress(88, "运行配置脚本");
             newState = newState with { Status = "unpacked" };
             WriteDpmPackage(newState);
             await RunMaintainerScriptAsync(previous, "postrm", ["upgrade", version], workDirectory, triggerQueue);
@@ -1447,26 +1458,11 @@ internal static class Program
             WriteDpmPackage(newState);
             AddRequestedDpmTriggers(triggerQueue);
             ActivateDpmTriggers(newState.TriggerActivations);
-            ReportProgress(100, "完成", true);
         }
         finally
         {
             if (Directory.Exists(workDirectory))
                 Directory.Delete(workDirectory, true);
-            if (progressStarted && !progressCompleted && !Console.IsOutputRedirected)
-                Console.WriteLine();
-        }
-
-        void ReportProgress(int percent, string stage, bool complete = false)
-        {
-            progressStarted = true;
-            progressCompleted = complete;
-            if (!complete && percent == lastReportedPercent &&
-                string.Equals(stage, lastReportedStage, StringComparison.Ordinal))
-                return;
-            lastReportedPercent = percent;
-            lastReportedStage = stage;
-            RenderDpmPackageProgress("安装", expected.Name, percent, stage, complete);
         }
     }
 
@@ -1599,8 +1595,7 @@ internal static class Program
 
     private static async Task<(List<string> Paths, List<string> Directories)> ExtractTarToDirectoryAsync(
         string tarPath,
-        string destinationDirectory,
-        Action<long, long>? progress = null)
+        string destinationDirectory)
     {
         var paths = new List<string>();
         var directories = new List<string>();
@@ -1650,8 +1645,6 @@ internal static class Program
                     throw new InvalidDataException(
                         $"Package contains an unsupported tar entry type: {entry.EntryType} ({entry.Name})");
             }
-            progress?.Invoke(stream.Position, stream.Length);
-
             if (!paths.Contains(path, StringComparer.Ordinal))
                 paths.Add(path);
         }
@@ -1825,14 +1818,11 @@ internal static class Program
     private static async Task CopyDpmPackageFilesAsync(
         string sourceDirectory,
         DpmPackageState package,
-        DpmPackageState? previous,
-        Action<int, int>? progress = null)
+        DpmPackageState? previous)
     {
         var oldFiles = previous?.Files.ToHashSet(StringComparer.Ordinal) ?? [];
         var conffiles = package.Conffiles.ToHashSet(StringComparer.Ordinal);
         var createdDirectories = new List<string>();
-        var completedFiles = 0;
-        var totalFiles = package.Files.Count;
         foreach (var relativePath in package.Files
                      .ToList()
                      .OrderBy(path => path.Count(character => character == '/'))
@@ -1859,7 +1849,6 @@ internal static class Program
                 Directory.CreateDirectory(targetPath);
                 if (!targetExisted)
                     createdDirectories.Add(relativePath);
-                ReportFileProgress();
                 continue;
             }
 
@@ -1887,7 +1876,6 @@ internal static class Program
                     package.Files.Add(newRelativePath);
                 package.FileHashes[newRelativePath] = await GetDpmPathHashAsync(newPath);
                 package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
-                ReportFileProgress();
                 continue;
             }
             if (targetExists && !oldFiles.Contains(relativePath))
@@ -1904,7 +1892,6 @@ internal static class Program
                 File.Delete(targetPath);
             await CopyPackageFileAsync(sourcePath, targetPath, isSymlink);
             package.FileHashes[relativePath] = await GetDpmPathHashAsync(targetPath);
-            ReportFileProgress();
         }
 
         if (!OperatingSystem.IsWindows())
@@ -1923,11 +1910,6 @@ internal static class Program
                 package.ConffileHashes[conffile] = await GetFileSha256Async(sourcePath);
         }
 
-        void ReportFileProgress()
-        {
-            completedFiles++;
-            progress?.Invoke(completedFiles, totalFiles);
-        }
     }
 
     private static async Task CopyPackageFileAsync(
@@ -3707,7 +3689,9 @@ internal static class Program
         IReadOnlyList<string> arguments,
         int expectedPackageCount = 0,
         bool showProgress = false,
-        IReadOnlySet<string>? progressPackages = null)
+        IReadOnlySet<string>? progressPackages = null,
+        Action<string>? onPackageCompleted = null,
+        Action<string>? onPackageStarted = null)
     {
         var start = new ProcessStartInfo("dpkg")
         {
@@ -3721,12 +3705,13 @@ internal static class Program
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start dpkg.");
         var outputTask = showProgress ? process.StandardOutput.ReadToEndAsync() : null;
         var errorOutput = showProgress
-            ? await ReadDpkgProgressAsync(process, expectedPackageCount, progressPackages)
+            ? await ReadDpkgProgressAsync(
+                process, expectedPackageCount, progressPackages, onPackageCompleted, onPackageStarted)
             : "";
         await process.WaitForExitAsync();
         if (outputTask is not null)
             await outputTask;
-        if (showProgress && process.ExitCode == 0)
+        if (showProgress && onPackageCompleted is null && process.ExitCode == 0)
             RenderDpkgProgress(expectedPackageCount, expectedPackageCount, null, "完成", true);
         else if (showProgress && !Console.IsOutputRedirected)
             Console.WriteLine();
@@ -3744,7 +3729,9 @@ internal static class Program
     private static async Task<string> ReadDpkgProgressAsync(
         Process process,
         int totalPackages,
-        IReadOnlySet<string>? progressPackages)
+        IReadOnlySet<string>? progressPackages,
+        Action<string>? onPackageCompleted = null,
+        Action<string>? onPackageStarted = null)
     {
         var completed = new HashSet<string>(StringComparer.Ordinal);
         var diagnostics = new StringBuilder();
@@ -3765,7 +3752,10 @@ internal static class Program
                     !IsExpectedProgressPackage(currentPackage))
                     continue;
 
-                RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
+                if (onPackageStarted is not null)
+                    onPackageStarted(currentPackage);
+                else if (onPackageCompleted is null)
+                    RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
             }
             else if (line.StartsWith("status: ", StringComparison.Ordinal))
             {
@@ -3787,7 +3777,10 @@ internal static class Program
                         completed.Add(package))
                     {
                         currentPackage = package;
-                        RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
+                        if (onPackageCompleted is null)
+                            RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
+                        else
+                            onPackageCompleted(package);
                     }
                 }
             }
@@ -3860,6 +3853,72 @@ internal static class Program
 
         if (complete)
             Console.WriteLine();
+    }
+
+    private sealed class PackageInstallProgress(IReadOnlyList<PackageRecord> packages)
+    {
+        private readonly HashSet<string> _completed = new(StringComparer.Ordinal);
+        private bool _finished;
+        private string? _currentPackage;
+
+        public void Start() => Draw(false);
+
+        public void SetCurrentPackage(string packageName)
+        {
+            var package = packages.FirstOrDefault(expected =>
+                PackageNameMatches(expected.Name, packageName) ||
+                PackageNameMatches(packageName, expected.Name));
+            _currentPackage = package?.Name ?? packageName;
+            Draw(false);
+        }
+
+        public void SetStage(string stage)
+        {
+            _currentPackage = stage;
+            Draw(false);
+        }
+
+        public void CompletePackage(string packageName)
+        {
+            var package = packages.FirstOrDefault(expected =>
+                PackageNameMatches(expected.Name, packageName) ||
+                PackageNameMatches(packageName, expected.Name));
+            if (package is null || !_completed.Add(package.Name))
+                return;
+            _currentPackage = package.Name;
+            Draw(false);
+        }
+
+        public void Complete()
+        {
+            _finished = true;
+            _currentPackage = null;
+            Draw(true);
+        }
+
+        public void End()
+        {
+            if (!_finished && !Console.IsOutputRedirected)
+                Console.WriteLine();
+        }
+
+        private void Draw(bool complete)
+        {
+            var total = packages.Count;
+            var completed = _completed.Count;
+            var percent = complete ? 100 : Math.Min(99, completed * 100 / total);
+            const int width = 20;
+            var filled = percent * width / 100;
+            var bar = new string('#', filled) + new string('-', width - filled);
+            var detail = _currentPackage is null ? "" : $" {_currentPackage}";
+            var message = $"安装 [{bar}] [{completed}/{total}]{detail}";
+            if (Console.IsOutputRedirected)
+                Console.WriteLine(message);
+            else
+                Console.Write($"\r{message}\u001b[K");
+            if (complete)
+                Console.WriteLine();
+        }
     }
 
     private static async Task DecompressAsync(string command, IReadOnlyList<string> arguments, string destination)
