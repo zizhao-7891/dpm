@@ -16,7 +16,7 @@ Build a self-contained Debian package for `arm64` (default), `amd64`, or
 
 ```sh
 ./build-deb.sh
-sudo dpkg -i dist/dpm_0.1.50_arm64.deb
+sudo dpkg -i dist/dpm_0.1.51_arm64.deb
 ```
 
 The build requires the .NET 8 SDK and `dpkg-deb`. Set `ARCH` to select a
@@ -195,12 +195,12 @@ input defaults to cancellation. Use `-y`/`--yes` to automatically confirm or
 `-n`/`--no` to automatically cancel confirmation prompts; either option can
 appear before or after the command. They cannot be combined.
 
-During install, reinstall, and upgrade, the installation phase uses one
-transaction-wide progress bar with completed/total package counts for both
-dpkg-managed and dpm-managed packages. The separate download phase retains its
-byte-based progress. During removal, dpkg-managed packages use dpkg's
-machine-readable status events; dpm-managed packages are removed in dependency
-order by dpm. Maintainer scripts continue to use the terminal normally. Failed
+During install, reinstall, upgrade, remove, and purge, package operations use
+one transaction-wide progress bar with completed/total package counts across
+both dpkg-managed and dpm-managed packages. Upgrade and removal progress
+includes a percentage and the current package; dpm-managed removals also show
+their current stage. The separate download phase retains its byte-based
+progress. Maintainer scripts continue to use the terminal normally. Failed
 dpm maintainer scripts remain in the dpm package database for repair with
 `dpm fix`.
 

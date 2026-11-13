@@ -677,7 +677,7 @@ internal static class Program
         if (orderedPlan.Count > 0)
         {
             var files = await DownloadPackagesAsync(orderedPlan);
-            await InstallPackagesAsync(files, orderedPlan);
+            await InstallPackagesAsync(files, orderedPlan, "安装");
         }
         if (!string.IsNullOrWhiteSpace(pendingConfiguration))
             await ConfigurePendingPackagesAsync();
@@ -862,7 +862,7 @@ internal static class Program
             return;
 
         var files = await DownloadPackagesAsync(orderedPlan);
-        await InstallPackagesAsync(files, orderedPlan);
+        await InstallPackagesAsync(files, orderedPlan, "重新安装");
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, roots.Select(root => root.Name));
         WriteDpmAutoInstalled(autoInstalled);
@@ -944,36 +944,57 @@ internal static class Program
 
         var systemInstalled = await GetSystemInstalledAsync();
         var removalOrder = OrderPackagesForRemoval(installed, removalSet);
-        for (var index = 0; index < removalOrder.Count;)
+        var progress = new PackageOperationProgress(
+            removalOrder,
+            purge ? "清除" : "卸载");
+        progress.Start();
+        try
         {
-            var systemManaged = systemInstalled.Keys.Any(name =>
-                                     PackageNameMatches(name, removalOrder[index])) ||
-                                 systemConfigFiles.Any(name =>
-                                     PackageNameMatches(name, removalOrder[index]));
-            var groupStart = index++;
-            while (index < removalOrder.Count)
+            for (var index = 0; index < removalOrder.Count;)
             {
-                var nextSystemManaged = systemInstalled.Keys.Any(name =>
-                                            PackageNameMatches(name, removalOrder[index])) ||
-                                        systemConfigFiles.Any(name =>
-                                            PackageNameMatches(name, removalOrder[index]));
-                if (nextSystemManaged != systemManaged)
-                    break;
-                index++;
-            }
-            var group = removalOrder.Skip(groupStart).Take(index - groupStart).ToArray();
-            if (!systemManaged)
-            {
-                await RemoveDpmPackagesAsync(group, purge);
-                continue;
-            }
+                var systemManaged = systemInstalled.Keys.Any(name =>
+                                         PackageNameMatches(name, removalOrder[index])) ||
+                                     systemConfigFiles.Any(name =>
+                                         PackageNameMatches(name, removalOrder[index]));
+                var groupStart = index++;
+                while (index < removalOrder.Count)
+                {
+                    var nextSystemManaged = systemInstalled.Keys.Any(name =>
+                                                PackageNameMatches(name, removalOrder[index])) ||
+                                            systemConfigFiles.Any(name =>
+                                                PackageNameMatches(name, removalOrder[index]));
+                    if (nextSystemManaged != systemManaged)
+                        break;
+                    index++;
+                }
+                var group = removalOrder.Skip(groupStart).Take(index - groupStart).ToArray();
+                if (!systemManaged)
+                {
+                    await RemoveDpmPackagesAsync(
+                        group,
+                        purge,
+                        progress.SetCurrentPackage,
+                        progress.SetStage,
+                        progress.CompletePackage);
+                    continue;
+                }
 
-            var dpkgAction = purge ? "--purge" : "--remove";
-            await RunDpkgAsync(
-                [dpkgAction, "--", .. group],
-                group.Length,
-                true,
-                group.ToHashSet(StringComparer.Ordinal));
+                var dpkgAction = purge ? "--purge" : "--remove";
+                await RunDpkgAsync(
+                    [dpkgAction, "--", .. group],
+                    group.Length,
+                    true,
+                    group.ToHashSet(StringComparer.Ordinal),
+                    progress.CompletePackage,
+                    progress.SetCurrentPackage);
+                foreach (var packageName in group)
+                    progress.CompletePackage(packageName);
+            }
+            progress.Complete();
+        }
+        finally
+        {
+            progress.End();
         }
         var dpmAutoInstalled = ReadDpmAutoInstalled();
         dpmAutoInstalled.ExceptWith(removalSet);
@@ -1057,7 +1078,7 @@ internal static class Program
             return;
 
         var files = await DownloadPackagesAsync(orderedPlan);
-        await InstallPackagesAsync(files, orderedPlan);
+        await InstallPackagesAsync(files, orderedPlan, "升级");
         var autoInstalled = ReadDpmAutoInstalled();
         AddNewAutomaticDependencies(autoInstalled, plan, installed, candidates.Select(item => item.Candidate.Name));
         WriteDpmAutoInstalled(autoInstalled);
@@ -1252,7 +1273,8 @@ internal static class Program
 
     private static async Task InstallPackagesAsync(
         IReadOnlyList<string> files,
-        IReadOnlyList<PackageRecord> packages)
+        IReadOnlyList<PackageRecord> packages,
+        string action)
     {
         if (files.Count != packages.Count)
             throw new InvalidOperationException("The downloaded package list does not match the installation plan.");
@@ -1260,7 +1282,9 @@ internal static class Program
         if (packages.Count == 0)
             return;
 
-        var progress = new PackageInstallProgress(packages);
+        var progress = new PackageOperationProgress(
+            packages.Select(package => package.Name).ToArray(),
+            action);
         progress.Start();
         var dpmInstallCount = 0;
         try
@@ -2041,7 +2065,12 @@ internal static class Program
         }
     }
 
-    private static async Task RemoveDpmPackagesAsync(IReadOnlyList<string> packageNames, bool purge)
+    private static async Task RemoveDpmPackagesAsync(
+        IReadOnlyList<string> packageNames,
+        bool purge,
+        Action<string> onPackageStarted,
+        Action<string, string> onStageChanged,
+        Action<string> onPackageCompleted)
     {
         var states = ReadDpmPackages();
         foreach (var packageName in packageNames)
@@ -2050,16 +2079,13 @@ internal static class Program
                           ?? throw new InvalidOperationException($"dpm package state is missing for '{packageName}'.");
             var workDirectory = Path.Combine(DpmStateDirectory, "tmp", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(workDirectory);
-            var progressStarted = false;
-            var progressCompleted = false;
-            var lastReportedPercent = -1;
-            var lastReportedStage = "";
             try
             {
-                ReportProgress(0, "准备");
+                onPackageStarted(package.Name);
+                onStageChanged(package.Name, "准备");
                 var triggerQueue = Path.Combine(workDirectory, "trigger-queue");
                 await RunMaintainerScriptAsync(package, "prerm", ["remove"], workDirectory, triggerQueue);
-                ReportProgress(10, "运行卸载前脚本");
+                onStageChanged(package.Name, "运行卸载前脚本");
                 var files = package.Files
                     .OrderByDescending(path => path.Count(character => character == '/'))
                     .ToList();
@@ -2068,9 +2094,9 @@ internal static class Program
                     var path = files[index];
                     if (purge || !package.Conffiles.Contains(path, StringComparer.Ordinal))
                         DeleteDpmPath(package, path);
-                    ReportProgress(10 + (int)((index + 1) * 75d / Math.Max(1, files.Count)), "删除文件");
+                    onStageChanged(package.Name, $"删除文件 {index + 1}/{files.Count}");
                 }
-                ReportProgress(88, "运行卸载脚本");
+                onStageChanged(package.Name, "运行卸载脚本");
                 await RunMaintainerScriptAsync(package, "postrm",
                     purge ? ["purge"] : ["remove"], workDirectory, triggerQueue);
 
@@ -2088,33 +2114,14 @@ internal static class Program
                     WriteDpmPackage(configOnly);
                 }
                 AddRequestedDpmTriggers(triggerQueue);
-                ReportProgress(95, "处理触发器");
+                onStageChanged(package.Name, "处理触发器");
                 await ProcessDpmTriggersAsync();
-                ReportProgress(100, purge ? "已彻底清除" : "已卸载", true);
-
-                void ReportProgress(int percent, string stage, bool complete = false)
-                {
-                    progressStarted = true;
-                    progressCompleted = complete;
-                    if (!complete && percent == lastReportedPercent &&
-                        string.Equals(stage, lastReportedStage, StringComparison.Ordinal))
-                        return;
-                    lastReportedPercent = percent;
-                    lastReportedStage = stage;
-                    RenderDpmPackageProgress(
-                        purge ? "清除" : "卸载",
-                        package.Name,
-                        percent,
-                        stage,
-                        complete);
-                }
+                onPackageCompleted(package.Name);
             }
             finally
             {
                 if (Directory.Exists(workDirectory))
                     Directory.Delete(workDirectory, true);
-                if (progressStarted && !progressCompleted && !Console.IsOutputRedirected)
-                    Console.WriteLine();
             }
         }
     }
@@ -3713,7 +3720,7 @@ internal static class Program
             await outputTask;
         if (showProgress && onPackageCompleted is null && process.ExitCode == 0)
             RenderDpkgProgress(expectedPackageCount, expectedPackageCount, null, "完成", true);
-        else if (showProgress && !Console.IsOutputRedirected)
+        else if (showProgress && onPackageCompleted is null && !Console.IsOutputRedirected)
             Console.WriteLine();
         if (process.ExitCode != 0)
         {
@@ -3831,31 +3838,7 @@ internal static class Program
             Console.WriteLine();
     }
 
-    private static void RenderDpmPackageProgress(
-        string action,
-        string package,
-        int percent,
-        string stage,
-        bool complete = false)
-    {
-        percent = Math.Clamp(percent, 0, 100);
-        const int width = 16;
-        var filled = percent * width / 100;
-        var bar = new string('#', filled) + new string('-', width - filled);
-        var message = $"{action} {package} [{bar}] {percent,3}% {stage}";
-        if (Console.IsOutputRedirected)
-        {
-            if (complete)
-                Console.WriteLine(message);
-        }
-        else
-            Console.Write($"\r{message}\u001b[K");
-
-        if (complete)
-            Console.WriteLine();
-    }
-
-    private sealed class PackageInstallProgress(IReadOnlyList<PackageRecord> packages)
+    private sealed class PackageOperationProgress(IReadOnlyList<string> packages, string action)
     {
         private readonly HashSet<string> _completed = new(StringComparer.Ordinal);
         private bool _finished;
@@ -3865,10 +3848,13 @@ internal static class Program
 
         public void SetCurrentPackage(string packageName)
         {
-            var package = packages.FirstOrDefault(expected =>
-                PackageNameMatches(expected.Name, packageName) ||
-                PackageNameMatches(packageName, expected.Name));
-            _currentPackage = package?.Name ?? packageName;
+            _currentPackage = FindPackageName(packageName) ?? packageName;
+            Draw(false);
+        }
+
+        public void SetStage(string packageName, string stage)
+        {
+            _currentPackage = $"{FindPackageName(packageName) ?? packageName} {stage}";
             Draw(false);
         }
 
@@ -3880,12 +3866,10 @@ internal static class Program
 
         public void CompletePackage(string packageName)
         {
-            var package = packages.FirstOrDefault(expected =>
-                PackageNameMatches(expected.Name, packageName) ||
-                PackageNameMatches(packageName, expected.Name));
-            if (package is null || !_completed.Add(package.Name))
+            var package = FindPackageName(packageName);
+            if (package is null || !_completed.Add(package))
                 return;
-            _currentPackage = package.Name;
+            _currentPackage = package;
             Draw(false);
         }
 
@@ -3905,13 +3889,15 @@ internal static class Program
         private void Draw(bool complete)
         {
             var total = packages.Count;
+            if (total == 0)
+                return;
             var completed = _completed.Count;
             var percent = complete ? 100 : Math.Min(99, completed * 100 / total);
             const int width = 20;
             var filled = percent * width / 100;
             var bar = new string('#', filled) + new string('-', width - filled);
             var detail = _currentPackage is null ? "" : $" {_currentPackage}";
-            var message = $"安装 [{bar}] [{completed}/{total}]{detail}";
+            var message = $"{action} [{bar}] [{completed}/{total}] {percent}%{detail}";
             if (Console.IsOutputRedirected)
                 Console.WriteLine(message);
             else
@@ -3919,6 +3905,11 @@ internal static class Program
             if (complete)
                 Console.WriteLine();
         }
+
+        private string? FindPackageName(string packageName) =>
+            packages.FirstOrDefault(expected =>
+                PackageNameMatches(expected, packageName) ||
+                PackageNameMatches(packageName, expected));
     }
 
     private static async Task DecompressAsync(string command, IReadOnlyList<string> arguments, string destination)
