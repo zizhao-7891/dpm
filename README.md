@@ -102,6 +102,10 @@ dpm clear                 # clear downloaded .deb cache (keeps indexes)
 dpm search TERM
 ```
 
+`--verbose` prints diagnostic details such as repository/index cache decisions,
+dependency plans, download and checksum activity, and subprocess output. It can
+appear before or after the command. `--all-log` is an alias for `--verbose`.
+
 Package-name patterns support `*` (any sequence) and `?` (one character) in
 `install`, `reinstall`, `remove`, `purge`, `upgrade`, `download`, and `search`.
 For example, `dpm install 'python3-*'` selects the newest indexed version of

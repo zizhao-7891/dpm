@@ -39,6 +39,7 @@ internal static class Program
     }
 
     private static ConfirmationMode Confirmation = ConfirmationMode.Prompt;
+    private static bool Verbose;
     private static List<PackageRecord>? PackageCache;
     private static HashSet<string>? SystemPackageFiles;
 
@@ -48,6 +49,7 @@ internal static class Program
         var assumeNo = args.Any(argument => argument is "-n" or "--no");
         var fixBroken = args.Any(argument => argument is "-f" or "-fix" or "--fix-broken");
         var noAutoRemove = args.Contains("--no-autoremove", StringComparer.Ordinal);
+        Verbose = args.Any(argument => argument is "--verbose" or "--all-log");
         if (assumeYes && assumeNo)
         {
             Console.Error.WriteLine("Error: -y and -n cannot be used together.");
@@ -57,7 +59,8 @@ internal static class Program
             ? ConfirmationMode.Yes
             : assumeNo ? ConfirmationMode.No : ConfirmationMode.Prompt;
         args = args.Where(argument =>
-            argument is not ("-y" or "--yes" or "-n" or "--no" or "-f" or "-fix" or "--fix-broken" or "--no-autoremove"))
+            argument is not ("-y" or "--yes" or "-n" or "--no" or "-f" or "-fix" or "--fix-broken" or
+                "--no-autoremove" or "--verbose" or "--all-log"))
             .ToArray();
         if (fixBroken && args.Length == 0)
             args = ["fix"];
@@ -86,6 +89,7 @@ internal static class Program
 
         try
         {
+            VerboseLog($"命令: dpm {string.Join(' ', args)}");
             using var operationLock = AcquireDpmLock();
             Directory.CreateDirectory(IndexDirectory);
             Directory.CreateDirectory(PackageDirectory);
@@ -264,7 +268,28 @@ internal static class Program
               -n, --no                  automatically cancel package/cache changes
               -f, -fix, --fix-broken    repair broken dependencies
               --no-autoremove           keep automatic orphan dependencies during remove/purge
+              --verbose                 show detailed diagnostic output
+              --all-log                 alias for --verbose
             """);
+    }
+
+    private static void VerboseLog(string message)
+    {
+        if (Verbose)
+            Console.Error.WriteLine($"[verbose] {message}");
+    }
+
+    private static void VerboseLogOutput(string label, string output)
+    {
+        if (!Verbose || string.IsNullOrWhiteSpace(output))
+            return;
+
+        const int maxOutputLength = 4000;
+        var text = output.TrimEnd();
+        if (text.Length > maxOutputLength)
+            text = text[..maxOutputLength] + $"{Environment.NewLine}... (截断，共 {output.Length} 个字符)";
+        foreach (var line in text.Split('\n'))
+            Console.Error.WriteLine($"[verbose] {label}: {line.TrimEnd('\r')}");
     }
 
     private static void RequireCount(string[] args, int count)
@@ -280,6 +305,7 @@ internal static class Program
 
         var architecture = await GetArchitectureAsync();
         var keyrings = GetKeyrings();
+        VerboseLog($"更新索引: 检测到 {sources.Count} 个源、{keyrings.Count} 个签名密钥，系统架构 {architecture}。");
         if (keyrings.Count == 0)
             throw new InvalidOperationException("No APT signing keyrings found; refusing to use unsigned repository metadata.");
 
@@ -294,6 +320,7 @@ internal static class Program
         RenderIndexProgress(done, total);
         foreach (var source in applicableSources)
         {
+            VerboseLog($"软件源: {source.Uri} {source.Suite} ({string.Join(", ", source.Components)})");
             var components = source.IsFlat ? new string?[] { null } : source.Components.Select(component => (string?)component);
             foreach (var component in components)
             {
@@ -304,6 +331,7 @@ internal static class Program
         }
         if (unchanged > 0)
             Console.WriteLine($"有 {unchanged} 个本地索引与服务器一致，已跳过下载。");
+        VerboseLog($"索引更新完成: {done - unchanged} 个下载并验证，{unchanged} 个缓存未变化。");
     }
 
     private static async Task CheckSourcesAsync()
@@ -527,13 +555,16 @@ internal static class Program
                 File.ReadAllText(sourcePath).Trim() == source.Uri &&
                 IsCachedIndexCurrent(metadataPath, metadata))
             {
+                VerboseLog($"索引未变化，使用缓存: {source.Uri} {relativePath}");
                 return false;
             }
 
             var compressedPath = Path.Combine(temp, "Packages.download");
+            VerboseLog($"下载软件包索引: {source.Uri} {relativePath}");
             await DownloadToFileAsync(new Uri(distUri + relativePath), compressedPath);
             if (!await HasHashAsync(compressedPath, expectedHash))
                 throw new InvalidDataException($"SHA256 mismatch for {source.Uri} {relativePath}.");
+            VerboseLog($"索引 SHA256 验证成功: {relativePath} ({expectedHash})");
 
             var stagedIndex = destination + "." + Guid.NewGuid().ToString("N") + ".part";
             var stagedMetadata = metadataPath + "." + Guid.NewGuid().ToString("N") + ".part";
@@ -1166,7 +1197,9 @@ internal static class Program
             return;
         }
 
+        VerboseLog($"查询最新 dpm Release: {LatestReleaseApi}");
         using var releaseResponse = await Http.GetAsync(LatestReleaseApi);
+        VerboseLog($"GitHub API 响应: {(int)releaseResponse.StatusCode} {releaseResponse.ReasonPhrase}");
         if (!releaseResponse.IsSuccessStatusCode)
             throw new HttpRequestException(
                 $"Could not query the latest dpm release: HTTP {(int)releaseResponse.StatusCode} {releaseResponse.ReasonPhrase}.");
@@ -2721,7 +2754,9 @@ internal static class Program
         var initialDecisions = new List<DependencyDecision>();
         try
         {
-            return ResolveDependencies(roots, installed, noChoices, initialDecisions);
+            var plan = ResolveDependencies(roots, installed, noChoices, initialDecisions);
+            LogDependencyPlan(roots, plan);
+            return plan;
         }
         catch (DependencyResolutionException exception)
         {
@@ -2768,7 +2803,10 @@ internal static class Program
             throw CreateDependencyFailure(firstFailure);
 
         if (solutions.Count == 1)
+        {
+            LogDependencyPlan(roots, solutions[0]);
             return solutions[0];
+        }
 
         var changesBySolution = solutions
             .Select(solution => CreatePackageChanges(solution, installed))
@@ -2791,6 +2829,7 @@ internal static class Program
         if (Confirmation == ConfirmationMode.Yes)
         {
             Console.WriteLine("已指定 -y，自动选择第一个依赖解决方案。");
+            LogDependencyPlan(roots, solutions[0]);
             return solutions[0];
         }
         if (Confirmation == ConfirmationMode.No || Console.IsInputRedirected)
@@ -2798,6 +2837,7 @@ internal static class Program
             Console.WriteLine(Confirmation == ConfirmationMode.No
                 ? "已指定 -n，自动选择第一个方案；稍后将取消操作。"
                 : "检测到非交互输入，默认选择第一个方案；后续确认将取消操作。");
+            LogDependencyPlan(roots, solutions[0]);
             return solutions[0];
         }
 
@@ -2811,8 +2851,20 @@ internal static class Program
                 throw new OperationCanceledException("用户取消了依赖解决方案选择。");
             if (int.TryParse(response, NumberStyles.None, CultureInfo.InvariantCulture, out var selected) &&
                 selected >= 1 && selected <= solutions.Count)
+            {
+                LogDependencyPlan(roots, solutions[selected - 1]);
                 return solutions[selected - 1];
+            }
             Console.WriteLine("请输入有效的方案编号，或输入 q 取消。");
+        }
+
+        static void LogDependencyPlan(
+            IReadOnlyList<PackageRecord> requestedRoots,
+            IReadOnlyDictionary<string, PackageRecord> resolvedPlan)
+        {
+            VerboseLog($"依赖方案: {requestedRoots.Count} 个请求包，最终包含 {resolvedPlan.Count} 个包。");
+            foreach (var package in resolvedPlan.Values.OrderBy(package => package.Name, StringComparer.Ordinal))
+                VerboseLog($"  {package.Name} {package.Version}");
         }
 
         void EnqueueAlternatives(
@@ -3362,7 +3414,10 @@ internal static class Program
 
             var destination = GetPackageCachePath(package);
             if (File.Exists(destination) && await HasHashAsync(destination, package.Sha256))
+            {
+                VerboseLog($"使用已验证的软件包缓存: {package.Name} {package.Version} ({destination})");
                 cachedFiles[package] = destination;
+            }
             else
                 pending.Add(package);
         }
@@ -3380,7 +3435,10 @@ internal static class Program
     {
         var destination = GetPackageCachePath(package);
         if (File.Exists(destination) && await HasHashAsync(destination, package.Sha256))
+        {
+            VerboseLog($"使用已验证的软件包缓存: {package.Name} {package.Version} ({destination})");
             return destination;
+        }
 
         var temp = destination + "." + Guid.NewGuid().ToString("N") + ".part";
         try
@@ -3390,6 +3448,7 @@ internal static class Program
             var downloadedBytes = await DownloadPackageWithProgressAsync(uri, temp, package, progress);
             if (!await HasHashAsync(temp, package.Sha256))
                 throw new InvalidDataException($"SHA256 mismatch for package {package.Name}; downloaded file was rejected.");
+            VerboseLog($"软件包 SHA256 验证成功: {package.Name} {package.Version} ({package.Sha256})");
             File.Move(temp, destination, true);
             progress?.CompletePackage(downloadedBytes);
             return destination;
@@ -3424,7 +3483,9 @@ internal static class Program
         PackageRecord package,
         PackageDownloadProgress? progress)
     {
+        VerboseLog($"下载软件包 {package.Name} {package.Version}: {uri}");
         using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+        VerboseLog($"HTTP 响应: {(int)response.StatusCode} {response.ReasonPhrase} ({uri})");
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
 
@@ -3454,6 +3515,7 @@ internal static class Program
         await output.FlushAsync();
         stopwatch.Stop();
         RenderDownloadProgress(package.Name, downloaded, totalBytes, stopwatch.Elapsed, progress, true);
+        VerboseLog($"软件包下载完成: {package.Name} {package.Version}，{downloaded} 字节，耗时 {stopwatch.Elapsed.TotalSeconds:0.0} 秒");
         return downloaded;
     }
 
@@ -3776,6 +3838,7 @@ internal static class Program
         Action<string>? onPackageCompleted = null,
         Action<string>? onPackageStarted = null)
     {
+        VerboseLog($"执行 dpkg: {string.Join(' ', arguments.Select(FormatLogArgument))}");
         var start = new ProcessStartInfo("dpkg")
         {
             UseShellExecute = false,
@@ -3807,6 +3870,7 @@ internal static class Program
             if (detail.Length > 0) message += $" 详情: {detail}";
             throw new InvalidOperationException(message);
         }
+        VerboseLog("dpkg 执行成功。");
     }
 
     private static async Task<string> ReadDpkgProgressAsync(
@@ -3835,6 +3899,7 @@ internal static class Program
                     !IsExpectedProgressPackage(currentPackage))
                     continue;
 
+                VerboseLog($"dpkg 阶段: {currentStage} {currentPackage}");
                 if (onPackageStarted is not null)
                     onPackageStarted(currentPackage);
                 else if (onPackageCompleted is null)
@@ -3859,6 +3924,7 @@ internal static class Program
                     if (isCurrentPackage && isExpectedPackage && isCompleted &&
                         completed.Add(package))
                     {
+                        VerboseLog($"dpkg 状态: {package} {status}");
                         currentPackage = package;
                         if (onPackageCompleted is null)
                             RenderDpkgProgress(completed.Count, totalPackages, currentPackage, currentStage);
@@ -3870,6 +3936,7 @@ internal static class Program
             else
             {
                 diagnostics.AppendLine(line);
+                VerboseLog($"dpkg: {line}");
             }
         }
         return diagnostics.ToString();
@@ -4003,35 +4070,54 @@ internal static class Program
 
     private static async Task<ProcessResult> RunProcessAsync(string command, IReadOnlyList<string> arguments)
     {
+        VerboseLog($"执行子进程: {command} {string.Join(' ', arguments.Select(FormatLogArgument))}");
         var start = new ProcessStartInfo(command) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
         using var process = Process.Start(start) ?? throw new InvalidOperationException($"Could not start {command}.");
         var outputTask = process.StandardOutput.ReadToEndAsync();
         var errorTask = process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
-        return new ProcessResult(process.ExitCode, await outputTask, await errorTask);
+        var output = await outputTask;
+        var error = await errorTask;
+        VerboseLog($"子进程结束: {command}，退出码 {process.ExitCode}");
+        VerboseLogOutput($"{command} stdout", output);
+        VerboseLogOutput($"{command} stderr", error);
+        return new ProcessResult(process.ExitCode, output, error);
     }
+
+    private static string FormatLogArgument(string argument) =>
+        "\"" + argument.Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
     private static async Task DownloadToFileAsync(Uri uri, string path)
     {
+        VerboseLog($"HTTP 下载: {uri}");
         using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+        VerboseLog($"HTTP 响应: {(int)response.StatusCode} {response.ReasonPhrase} ({uri})");
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
         await using var input = await response.Content.ReadAsStreamAsync();
         await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
         await input.CopyToAsync(output);
+        VerboseLog($"HTTP 下载完成: {path} ({output.Length} 字节)");
     }
 
     private static async Task<bool> TryDownloadToFileAsync(Uri uri, string path)
     {
+        VerboseLog($"HTTP 尝试下载: {uri}");
         using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+        {
+            VerboseLog($"HTTP 资源不存在: {uri}");
             return false;
+        }
+        VerboseLog($"HTTP 响应: {(int)response.StatusCode} {response.ReasonPhrase} ({uri})");
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
         await using var input = await response.Content.ReadAsStreamAsync();
         await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
         await input.CopyToAsync(output);
+        VerboseLog($"HTTP 下载完成: {path} ({output.Length} 字节)");
         return true;
     }
 
