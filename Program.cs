@@ -18,6 +18,7 @@ internal static class Program
     private const string DpmPackageDirectory = DpmStateDirectory + "/packages";
     private const string DpmTriggerFile = DpmStateDirectory + "/triggers.json";
     private const string AutoInstalledFile = DpmStateDirectory + "/auto-installed";
+    private const string HeldPackagesFile = DpmStateDirectory + "/held-packages";
     private const string DpmLockFile = "/run/lock/dpm.lock";
     private const int LockExclusive = 2;
     private const int LockNonBlocking = 4;
@@ -46,6 +47,7 @@ internal static class Program
         var assumeYes = args.Any(argument => argument is "-y" or "--yes");
         var assumeNo = args.Any(argument => argument is "-n" or "--no");
         var fixBroken = args.Any(argument => argument is "-f" or "-fix" or "--fix-broken");
+        var noAutoRemove = args.Contains("--no-autoremove", StringComparer.Ordinal);
         if (assumeYes && assumeNo)
         {
             Console.Error.WriteLine("Error: -y and -n cannot be used together.");
@@ -55,7 +57,7 @@ internal static class Program
             ? ConfirmationMode.Yes
             : assumeNo ? ConfirmationMode.No : ConfirmationMode.Prompt;
         args = args.Where(argument =>
-            argument is not ("-y" or "--yes" or "-n" or "--no" or "-f" or "-fix" or "--fix-broken"))
+            argument is not ("-y" or "--yes" or "-n" or "--no" or "-f" or "-fix" or "--fix-broken" or "--no-autoremove"))
             .ToArray();
         if (fixBroken && args.Length == 0)
             args = ["fix"];
@@ -75,6 +77,11 @@ internal static class Program
         {
             PrintUsage();
             return args.Length == 0 ? 2 : 0;
+        }
+        if (noAutoRemove && args[0] is not ("remove" or "uninstall" or "purge"))
+        {
+            Console.Error.WriteLine("Error: --no-autoremove can only be used with remove, uninstall, or purge.");
+            return 2;
         }
 
         try
@@ -113,11 +120,19 @@ internal static class Program
                 case "remove":
                 case "uninstall":
                     if (args.Length < 2) throw new ArgumentException("Usage: dpm remove PACKAGE [PACKAGE ...]");
-                    await RemoveAsync(args[1..], false);
+                    await RemoveAsync(args[1..], false, noAutoRemove);
                     break;
                 case "purge":
                     if (args.Length < 2) throw new ArgumentException("Usage: dpm purge PACKAGE [PACKAGE ...]");
-                    await RemoveAsync(args[1..], true);
+                    await RemoveAsync(args[1..], true, noAutoRemove);
+                    break;
+                case "hold":
+                    if (args.Length < 2) throw new ArgumentException("Usage: dpm hold PACKAGE|PATTERN [...]");
+                    await SetHeldPackagesAsync(args[1..], true);
+                    break;
+                case "unhold":
+                    if (args.Length < 2) throw new ArgumentException("Usage: dpm unhold PACKAGE|PATTERN [...]");
+                    await SetHeldPackagesAsync(args[1..], false);
                     break;
                 case "upgrade":
                     if (args.Length > 2) throw new ArgumentException("Usage: dpm upgrade [package]");
@@ -232,9 +247,11 @@ internal static class Program
               dpm -f | -fix             (alias for fix)
               dpm -f install PACKAGE... (repair existing dependencies and install packages)
               dpm reinstall PACKAGE|PATTERN
-              dpm remove PACKAGE|PATTERN [...]
+              dpm remove PACKAGE|PATTERN [...] [--no-autoremove]
               dpm uninstall PACKAGE|PATTERN [...] (alias for remove)
-              dpm purge PACKAGE|PATTERN [...] (remove packages and their configuration files)
+              dpm purge PACKAGE|PATTERN [...] [--no-autoremove] (remove packages and their configuration files)
+              dpm hold PACKAGE|PATTERN [...] (prevent packages from being upgraded)
+              dpm unhold PACKAGE|PATTERN [...] (allow packages to be upgraded again)
               dpm upgrade [PACKAGE|PATTERN]
               dpm upgrade-dpm           (upgrade dpm from the latest GitHub release)
               dpm check                 (dpkg consistency audit)
@@ -246,6 +263,7 @@ internal static class Program
               -y, --yes                 automatically confirm package/cache changes
               -n, --no                  automatically cancel package/cache changes
               -f, -fix, --fix-broken    repair broken dependencies
+              --no-autoremove           keep automatic orphan dependencies during remove/purge
             """);
     }
 
@@ -868,7 +886,10 @@ internal static class Program
         WriteDpmAutoInstalled(autoInstalled);
     }
 
-    private static async Task RemoveAsync(IReadOnlyList<string> packageNames, bool purge)
+    private static async Task RemoveAsync(
+        IReadOnlyList<string> packageNames,
+        bool purge,
+        bool noAutoRemove)
     {
         var installed = await GetInstalledAsync();
         var dpmStates = ReadDpmPackages();
@@ -907,7 +928,7 @@ internal static class Program
         }
 
         var autoInstalled = ReadAutoInstalledPackages();
-        var orphans = FindOrphanPackages(installed, autoInstalled, removalSet);
+        var orphans = noAutoRemove ? [] : FindOrphanPackages(installed, autoInstalled, removalSet);
         removalSet.UnionWith(orphans);
         var dependents = FindBlockingDependents(installed, removalSet);
         if (dependents.Count > 0)
@@ -1001,13 +1022,39 @@ internal static class Program
         WriteDpmAutoInstalled(dpmAutoInstalled);
     }
 
+    private static async Task SetHeldPackagesAsync(IReadOnlyList<string> packagePatterns, bool hold)
+    {
+        var installed = await GetInstalledAsync();
+        var heldPackages = ReadHeldPackages();
+        var matchedPackages = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var pattern in packagePatterns)
+        {
+            var matches = installed.Keys
+                .Where(packageName => MatchesPackageName(packageName, pattern))
+                .ToList();
+            if (matches.Count == 0)
+                throw new InvalidOperationException($"Installed package pattern '{pattern}' matched no packages.");
+            matchedPackages.UnionWith(matches);
+        }
+
+        foreach (var packageName in matchedPackages.Order(StringComparer.Ordinal))
+        {
+            var changed = hold ? heldPackages.Add(packageName) : heldPackages.Remove(packageName);
+            Console.WriteLine(changed
+                ? $"软件包 {packageName} 已{(hold ? "锁定" : "解除锁定")}。"
+                : $"软件包 {packageName} 已经{(hold ? "锁定" : "解除锁定")}。");
+        }
+        WriteHeldPackages(heldPackages);
+    }
+
     private static async Task UpgradeAsync(string? packageName)
     {
         var installed = await GetInstalledAsync();
+        var heldPackages = ReadHeldPackages();
         if (packageName is not null && HasWildcard(packageName) &&
             !LoadPackages().Any(package => MatchesPackageName(package.Name, packageName)))
             throw new InvalidOperationException($"Package pattern '{packageName}' matched no packages in the package indexes.");
-        var candidates = LoadPackages()
+        var availableCandidates = LoadPackages()
             .Where(p => packageName is null || MatchesPackageName(p.Name, packageName))
             .GroupBy(p => p.Name, StringComparer.Ordinal)
             .Select(group => SelectNewest(group)!)
@@ -1019,12 +1066,23 @@ internal static class Program
             .Where(item => item.Installed.Key is not null &&
                            IsVersionGreater(item.Candidate.Version, item.Installed.Value.Version))
             .ToList();
+        var heldCandidates = availableCandidates
+            .Where(item => IsPackageHeld(item.Candidate.Name, heldPackages))
+            .ToList();
+        var candidates = availableCandidates
+            .Where(item => !IsPackageHeld(item.Candidate.Name, heldPackages))
+            .ToList();
 
         if (candidates.Count == 0)
         {
-            Console.WriteLine("没有可升级的软件包。");
+            if (heldCandidates.Count > 0)
+                Console.WriteLine($"有 {heldCandidates.Count} 个可升级软件包因 hold 锁定而跳过。");
+            else
+                Console.WriteLine("没有可升级的软件包。");
             return;
         }
+        if (heldCandidates.Count > 0)
+            Console.WriteLine($"有 {heldCandidates.Count} 个可升级软件包因 hold 锁定而跳过。");
 
         var upgradeCandidates = candidates
             .Select(item => item.Candidate)
@@ -1102,6 +1160,11 @@ internal static class Program
         var installed = await GetInstalledAsync();
         if (!installed.TryGetValue("dpm", out var current))
             throw new InvalidOperationException("The dpm package is not registered as installed.");
+        if (IsPackageHeld("dpm", ReadHeldPackages()))
+        {
+            Console.WriteLine("软件包 dpm 已锁定；跳过升级。");
+            return;
+        }
 
         using var releaseResponse = await Http.GetAsync(LatestReleaseApi);
         if (!releaseResponse.IsSuccessStatusCode)
@@ -2600,6 +2663,16 @@ internal static class Program
         return ReadPackageStateFile(AutoInstalledFile);
     }
 
+    private static HashSet<string> ReadHeldPackages()
+    {
+        return ReadPackageStateFile(HeldPackagesFile);
+    }
+
+    private static bool IsPackageHeld(string packageName, IReadOnlySet<string> heldPackages) =>
+        heldPackages.Any(heldName =>
+            PackageNameMatches(packageName, heldName) ||
+            PackageNameMatches(heldName, packageName));
+
     private static HashSet<string> ReadPackageStateFile(string path)
     {
         if (!File.Exists(path))
@@ -2612,6 +2685,9 @@ internal static class Program
 
     private static void WriteDpmAutoInstalled(IEnumerable<string> packages)
         => WritePackageStateFile(AutoInstalledFile, packages);
+
+    private static void WriteHeldPackages(IEnumerable<string> packages)
+        => WritePackageStateFile(HeldPackagesFile, packages);
 
     private static void WritePackageStateFile(string path, IEnumerable<string> packages)
     {

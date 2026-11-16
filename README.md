@@ -88,9 +88,11 @@ dpm -f                    # alias for fix
 dpm -fix                  # alias for fix
 dpm -f install PACKAGE... # repairs dependencies and installs requested packages
 dpm reinstall PACKAGE|PATTERN
-dpm remove PACKAGE|PATTERN [...]
+dpm remove PACKAGE|PATTERN [...] [--no-autoremove]
 dpm uninstall PACKAGE|PATTERN [...] # alias for remove
-dpm purge PACKAGE|PATTERN [...] # removes packages and their configuration files
+dpm purge PACKAGE|PATTERN [...] [--no-autoremove] # removes packages and their configuration files
+dpm hold PACKAGE|PATTERN [...] # prevents matching packages from being upgraded
+dpm unhold PACKAGE|PATTERN [...] # allows matching packages to be upgraded again
 dpm upgrade [PACKAGE|PATTERN]
 dpm upgrade-dpm           # upgrades dpm from the latest GitHub release
 dpm check                 # audit dpkg and dpm package states
@@ -105,6 +107,11 @@ Package-name patterns support `*` (any sequence) and `?` (one character) in
 For example, `dpm install 'python3-*'` selects the newest indexed version of
 each matching package. Quote patterns so the shell passes them to `dpm`
 unchanged. `search` also continues to match terms in package descriptions.
+
+`hold` and `unhold` accept installed package names and patterns. Held packages
+are skipped by `upgrade` and `upgrade-dpm`; the hold state is stored by dpm in
+`/var/lib/dpm/held-packages` and applies to both dpkg-managed and dpm-managed
+packages.
 
 Before installing or upgrading, dpm resolves the complete dependency plan and
 shows it before making system changes. If the preferred plan has conflicting
@@ -187,6 +194,9 @@ reachable from any other installed package, including through `Recommends`, are
 kept. Before removal, dpm checks installed `Depends` and `Pre-Depends` and
 refuses to remove a package if any remaining package would be left with an
 unsatisfied dependency. Orphans are shown separately in the confirmation list.
+Use `--no-autoremove` with `remove`, `uninstall`, or `purge` to remove only the
+requested packages and keep automatic orphan dependencies installed. The flag
+may appear before or after the command arguments.
 
 Before installing, reinstalling, upgrading, or removing packages, `dpm` lists
 the package names and versions that will change and asks for confirmation.
