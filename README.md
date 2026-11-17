@@ -259,3 +259,4 @@ A: So you can update dpm itself without going to GitHub Releases, finding the ri
 
 Because dpm lives in  ~/.pm  and is not tracked by the dpkg database,  apt upgrade  will never see it — and it shouldn't. Self-upgrading is therefore a necessity of the self-managed domain, not a convenience feature.
 
+
