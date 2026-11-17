@@ -236,3 +236,26 @@ received-byte percentage and estimated remaining seconds.
 `dpm clear` shows the number and total size of cached `.deb` archives and asks
 for confirmation before deleting them. Package indexes are kept; `dpm clear
 -y` confirms the cleanup and `dpm clear -n` cancels it.
+
+## FAQ
+Q: How do I tell whether a package belongs to the dpkg domain or the dpm domain?
+
+A: Run  dpkg -S $(which <pkg>) . If it resolves to a package, it's in the dpkg domain; if not, it's in the dpm domain.
+Q: Why does  update  fail with an error?
+
+A: You haven't configured any software sources. Without sources, there is nothing to update from.
+
+If sources are configured and it still fails, triage by the error text:
+
+Could not resolve  → DNS, check  /etc/resolv.conf
+
+NO_PUBKEY  /  EXPKEYSIG  → missing or expired keyring
+
+404 arm64Packages  → wrong architecture in the source line
+
+Q: Why does the  upgrade-dpm  feature exist?
+
+A: So you can update dpm itself without going to GitHub Releases, finding the right arch, downloading, and overwriting it by hand. One command does it.
+
+Because dpm lives in  ~/.pm  and is not tracked by the dpkg database,  apt upgrade  will never see it — and it shouldn't. Self-upgrading is therefore a necessity of the self-managed domain, not a convenience feature.
+
