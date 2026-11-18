@@ -25,6 +25,40 @@ internal static class Program
     private const string GitHubRepository = "zizhao-7891/dpm";
     private const string LatestReleaseApi = "https://api.github.com/repos/" + GitHubRepository + "/releases/latest";
     private const string GitHubProxyPrefix = "https://gh-proxy.org/";
+    private const int MirrorBenchmarkBytes = 512 * 1024;
+    private static readonly MirrorCandidate[] DebianMirrors =
+    [
+        new("清华大学", "https://mirrors.tuna.tsinghua.edu.cn/debian/", "https://mirrors.tuna.tsinghua.edu.cn/debian-security/"),
+        new("中国科学技术大学", "https://mirrors.ustc.edu.cn/debian/", "https://mirrors.ustc.edu.cn/debian-security/"),
+        new("阿里云", "https://mirrors.aliyun.com/debian/", "https://mirrors.aliyun.com/debian-security/"),
+        new("华为云", "https://repo.huaweicloud.com/debian/", "https://repo.huaweicloud.com/debian-security/"),
+        new("北京外国语大学", "https://mirrors.bfsu.edu.cn/debian/", "https://mirrors.bfsu.edu.cn/debian-security/"),
+        new("上海交通大学", "https://mirror.sjtu.edu.cn/debian/", "https://mirror.sjtu.edu.cn/debian-security/"),
+        new("南京大学", "https://mirror.nju.edu.cn/debian/", "https://mirror.nju.edu.cn/debian-security/"),
+        new("浙江大学", "https://mirrors.zju.edu.cn/debian/", "https://mirrors.zju.edu.cn/debian-security/"),
+        new("腾讯云", "https://mirrors.cloud.tencent.com/debian/", "https://mirrors.cloud.tencent.com/debian-security/"),
+        new("网易", "https://mirrors.163.com/debian/", "https://mirrors.163.com/debian-security/"),
+        new("Debian CDN", "https://deb.debian.org/debian/", "https://deb.debian.org/debian-security/"),
+        new("Kernel.org", "https://mirrors.edge.kernel.org/debian/", "https://mirrors.edge.kernel.org/debian-security/"),
+        new("RWTH Aachen", "https://ftp.halifax.rwth-aachen.de/debian/", "https://ftp.halifax.rwth-aachen.de/debian-security/"),
+        new("Waterloo", "https://mirror.csclub.uwaterloo.ca/debian/", "https://mirror.csclub.uwaterloo.ca/debian-security/"),
+        new("Princeton", "https://mirror.math.princeton.edu/pub/debian/", "https://mirror.math.princeton.edu/pub/debian-security/")
+    ];
+    private static readonly MirrorCandidate[] UbuntuMirrors =
+    [
+        new("清华大学", "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/", "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/"),
+        new("中国科学技术大学", "https://mirrors.ustc.edu.cn/ubuntu/", "https://mirrors.ustc.edu.cn/ubuntu/"),
+        new("阿里云", "https://mirrors.aliyun.com/ubuntu/", "https://mirrors.aliyun.com/ubuntu/"),
+        new("华为云", "https://repo.huaweicloud.com/ubuntu/", "https://repo.huaweicloud.com/ubuntu/"),
+        new("北京外国语大学", "https://mirrors.bfsu.edu.cn/ubuntu/", "https://mirrors.bfsu.edu.cn/ubuntu/"),
+        new("上海交通大学", "https://mirror.sjtu.edu.cn/ubuntu/", "https://mirror.sjtu.edu.cn/ubuntu/"),
+        new("南京大学", "https://mirror.nju.edu.cn/ubuntu/", "https://mirror.nju.edu.cn/ubuntu/"),
+        new("腾讯云", "https://mirrors.cloud.tencent.com/ubuntu/", "https://mirrors.cloud.tencent.com/ubuntu/"),
+        new("Ubuntu archive", "https://archive.ubuntu.com/ubuntu/", "https://archive.ubuntu.com/ubuntu/"),
+        new("Kernel.org", "https://mirrors.edge.kernel.org/ubuntu/", "https://mirrors.edge.kernel.org/ubuntu/"),
+        new("Princeton", "https://mirror.math.princeton.edu/pub/ubuntu/", "https://mirror.math.princeton.edu/pub/ubuntu/"),
+        new("OSUOSL", "https://ubuntu.osuosl.org/ubuntu/", "https://ubuntu.osuosl.org/ubuntu/")
+    ];
     private static readonly HttpClient Http = new(new HttpClientHandler
     {
         AllowAutoRedirect = true
@@ -103,6 +137,10 @@ internal static class Program
                 case "check-sources":
                     RequireCount(args, 1);
                     await CheckSourcesAsync();
+                    break;
+                case "change-all-mirrors":
+                    RequireCount(args, 1);
+                    await ChangeAllMirrorsAsync();
                     break;
                 case "install":
                     if (args.Length < 2 && !fixBroken)
@@ -246,6 +284,7 @@ internal static class Program
               dpm update
               dpm up                    (alias for update)
               dpm check-sources         (check configured source suite, architecture, and indexes)
+              dpm change-all-mirrors   (test OS-compatible mirrors and save the fastest one)
               dpm install PACKAGE|PATTERN|FILE.deb [...] (updates indexes before installing)
               dpm fix                   (repair missing dependencies and configure pending packages)
               dpm -f | -fix             (alias for fix)
@@ -373,10 +412,350 @@ internal static class Program
             throw new InvalidOperationException($"{failures} configured software source(s) failed validation.");
     }
 
-    private static async Task ValidateSourceAsync(
+    private static async Task ChangeAllMirrorsAsync()
+    {
+        var sources = ReadSources();
+        var operatingSystem = ReadOperatingSystem();
+        var mirrors = GetMirrorCandidates(operatingSystem);
+        var matchingSources = sources
+            .Where(source => IsSupportedMirrorSource(source, operatingSystem))
+            .ToList();
+        if (matchingSources.Count == 0)
+            throw new InvalidOperationException(
+                $"No supported {operatingSystem.Id} mirror source entries were found to test.");
+
+        var keyrings = GetKeyrings();
+        if (keyrings.Count == 0)
+            throw new InvalidOperationException("No APT signing keyrings found; refusing to use unsigned repository metadata.");
+
+        var architecture = await GetArchitectureAsync();
+        var applicableSources = matchingSources
+            .Where(source => source.Architectures is null ||
+                             source.Architectures.Contains(architecture, StringComparer.Ordinal))
+            .GroupBy(source =>
+                $"{source.Uri}\n{source.Suite}\n{string.Join(" ", source.Components)}",
+                StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToList();
+        if (applicableSources.Count == 0)
+            throw new InvalidOperationException(
+                $"No {operatingSystem.Id} mirror source supports architecture {architecture}.");
+
+        Console.WriteLine($"系统: {operatingSystem.PrettyName}，架构: {architecture}");
+        Console.WriteLine($"测试套件: {string.Join(", ", applicableSources.Select(source => source.Suite).Distinct(StringComparer.Ordinal))}");
+        Console.WriteLine($"正在测试 {mirrors.Length} 个 {operatingSystem.Id} 镜像源...");
+        using var concurrency = new SemaphoreSlim(4);
+        var results = await Task.WhenAll(mirrors.Select(async mirror =>
+        {
+            await concurrency.WaitAsync();
+            try
+            {
+                return await TestMirrorAsync(
+                    mirror, applicableSources, architecture, keyrings, operatingSystem);
+            }
+            finally
+            {
+                concurrency.Release();
+            }
+        }));
+
+        foreach (var result in results.OrderByDescending(result => result.BytesPerSecond))
+        {
+            if (result.Error is null)
+                Console.WriteLine($"{result.Mirror.Name,-16} {result.BytesPerSecond / 1_000_000:0.00} MB/s");
+            else
+                Console.WriteLine($"{result.Mirror.Name,-16} 不可用: {result.Error}");
+        }
+
+        var fastest = results
+            .Where(result => result.Error is null)
+            .OrderByDescending(result => result.BytesPerSecond)
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"No {operatingSystem.Id} mirror passed signed metadata validation and speed testing; source files were not changed.");
+        Console.WriteLine($"最快镜像源: {fastest.Mirror.Name} ({fastest.BytesPerSecond / 1_000_000:0.00} MB/s)");
+        Console.WriteLine($"主仓库: {fastest.Mirror.MainUri}");
+        if (!IsUbuntuBased(operatingSystem))
+            Console.WriteLine($"安全更新仓库: {fastest.Mirror.SecurityUri}");
+
+        var replacements = matchingSources
+            .Select(source => source.Uri)
+            .Distinct(StringComparer.Ordinal)
+            .ToDictionary(
+                sourceUri => sourceUri,
+                sourceUri => GetMirrorUri(fastest.Mirror, sourceUri, operatingSystem),
+                StringComparer.Ordinal);
+        var updates = PrepareMirrorSourceUpdates(replacements);
+        if (updates.Count == 0)
+            throw new InvalidOperationException("No configured source lines could be updated.");
+
+        Console.WriteLine($"将更新 {updates.Count} 个软件源文件；原文件会保留为 .change-all-mirrors-*.bak。");
+        if (!ConfirmAction("是否保存最快镜像源？[y/N] "))
+            return;
+
+        SaveMirrorSourceUpdates(updates);
+        Console.WriteLine($"已将匹配的软件源切换到 {fastest.Mirror.Name}。原软件源已备份。");
+    }
+
+    private static async Task<MirrorTestResult> TestMirrorAsync(
+        MirrorCandidate mirror,
+        IReadOnlyList<RepositorySource> sources,
+        string architecture,
+        IReadOnlyList<string> keyrings,
+        OperatingSystemDetails operatingSystem)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        long totalBytes = 0;
+        var totalBenchmarkTime = TimeSpan.Zero;
+        try
+        {
+            foreach (var source in sources)
+            {
+                var mirrorUri = GetMirrorUri(mirror, source.Uri, operatingSystem);
+                var candidateSource = source with { Uri = mirrorUri };
+                var validation = await ValidateSourceAsync(
+                    candidateSource, architecture, keyrings, timeout.Token);
+                var stopwatch = Stopwatch.StartNew();
+                totalBytes += await MeasureMirrorSpeedAsync(validation, timeout.Token);
+                stopwatch.Stop();
+                totalBenchmarkTime += stopwatch.Elapsed;
+            }
+
+            var speed = totalBenchmarkTime.TotalSeconds > 0
+                ? totalBytes / totalBenchmarkTime.TotalSeconds
+                : 0;
+            VerboseLog($"镜像测速完成: {mirror.Name} {speed / 1_000_000:0.00} MB/s");
+            return new MirrorTestResult(mirror, speed, null);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or InvalidDataException or
+                                   InvalidOperationException or OperationCanceledException)
+        {
+            VerboseLog($"镜像不可用: {mirror.Name}: {ex.Message}");
+            return new MirrorTestResult(mirror, 0, ex.Message);
+        }
+    }
+
+    private static async Task<long> MeasureMirrorSpeedAsync(
+        ValidatedSource source,
+        CancellationToken cancellationToken)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, source.PackageIndexUri);
+        request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, MirrorBenchmarkBytes - 1);
+        using var response = await Http.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (!response.IsSuccessStatusCode)
+            throw new HttpRequestException(
+                $"Speed test failed for {source.PackageIndexUri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
+
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        var buffer = new byte[32 * 1024];
+        long received = 0;
+        while (received < MirrorBenchmarkBytes)
+        {
+            var count = (int)Math.Min(buffer.Length, MirrorBenchmarkBytes - received);
+            var read = await stream.ReadAsync(buffer.AsMemory(0, count), cancellationToken);
+            if (read == 0)
+                break;
+            received += read;
+        }
+        if (received == 0)
+            throw new InvalidDataException($"Speed test returned no package index data from {source.PackageIndexUri}.");
+        return received;
+    }
+
+    private static MirrorCandidate[] GetMirrorCandidates(OperatingSystemDetails operatingSystem)
+    {
+        if (IsUbuntuBased(operatingSystem))
+            return UbuntuMirrors;
+        if (operatingSystem.Id == "debian" ||
+            operatingSystem.IdLike.Contains("debian", StringComparer.Ordinal))
+            return DebianMirrors;
+        throw new InvalidOperationException(
+            $"No mirror catalog is available for OS ID '{operatingSystem.Id}' " +
+            $"(ID_LIKE: {string.Join(" ", operatingSystem.IdLike)}).");
+    }
+
+    private static bool IsSupportedMirrorSource(
+        RepositorySource source,
+        OperatingSystemDetails operatingSystem) =>
+        !source.IsFlat &&
+        (IsUbuntuBased(operatingSystem)
+            ? IsUbuntuSource(source.Uri)
+            : IsDebianMainSource(source.Uri) || IsDebianSecuritySource(source.Uri));
+
+    private static bool IsUbuntuBased(OperatingSystemDetails operatingSystem) =>
+        operatingSystem.Id == "ubuntu" ||
+        operatingSystem.IdLike.Contains("ubuntu", StringComparer.Ordinal);
+
+    private static string GetMirrorUri(
+        MirrorCandidate mirror,
+        string sourceUri,
+        OperatingSystemDetails operatingSystem) =>
+        !IsUbuntuBased(operatingSystem) && IsDebianSecuritySource(sourceUri)
+            ? mirror.SecurityUri
+            : mirror.MainUri;
+
+    private static bool IsDebianMainSource(string sourceUri) =>
+        Uri.TryCreate(sourceUri, UriKind.Absolute, out var uri) &&
+        uri.AbsolutePath.TrimEnd('/').EndsWith("/debian", StringComparison.Ordinal);
+
+    private static bool IsDebianSecuritySource(string sourceUri) =>
+        Uri.TryCreate(sourceUri, UriKind.Absolute, out var uri) &&
+        uri.AbsolutePath.TrimEnd('/').EndsWith("/debian-security", StringComparison.Ordinal);
+
+    private static bool IsUbuntuSource(string sourceUri) =>
+        Uri.TryCreate(sourceUri, UriKind.Absolute, out var uri) &&
+        uri.AbsolutePath.TrimEnd('/').EndsWith("/ubuntu", StringComparison.Ordinal);
+
+    private static OperatingSystemDetails ReadOperatingSystem()
+    {
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var line in File.ReadLines("/etc/os-release"))
+        {
+            var separator = line.IndexOf('=');
+            if (separator <= 0)
+                continue;
+            values[line[..separator]] = line[(separator + 1)..].Trim().Trim('"');
+        }
+        if (!values.TryGetValue("ID", out var id) || string.IsNullOrWhiteSpace(id) ||
+            !values.TryGetValue("PRETTY_NAME", out var prettyName))
+            throw new InvalidDataException("/etc/os-release must define ID and PRETTY_NAME.");
+        id = id.ToLowerInvariant();
+        string[] idLike = values.TryGetValue("ID_LIKE", out var relatedIds)
+            ? relatedIds.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => value.ToLowerInvariant())
+                .ToArray()
+            : Array.Empty<string>();
+        return new OperatingSystemDetails(id, prettyName, idLike);
+    }
+
+    private static List<MirrorSourceUpdate> PrepareMirrorSourceUpdates(
+        IReadOnlyDictionary<string, string> replacements)
+    {
+        var updates = new List<MirrorSourceUpdate>();
+        IEnumerable<string> sourceFiles = Directory.Exists(SourceDirectory)
+            ? Directory.EnumerateFiles(SourceDirectory)
+                .Where(file => file.EndsWith(".list", StringComparison.Ordinal))
+            : Enumerable.Empty<string>();
+        foreach (var path in sourceFiles)
+        {
+            var originalLines = File.ReadAllLines(path);
+            var changed = false;
+            var updatedLines = originalLines.Select(line =>
+            {
+                var token = GetSourceUriToken(line);
+                if (token is null ||
+                    !Uri.TryCreate(token.Value.Value, UriKind.Absolute, out var uri) ||
+                    !replacements.TryGetValue(uri.ToString(), out var replacement))
+                    return line;
+                changed = true;
+                return line[..token.Value.Start] + replacement +
+                       line[(token.Value.Start + token.Value.Length)..];
+            }).ToArray();
+            if (changed)
+                updates.Add(new MirrorSourceUpdate(path, string.Join(Environment.NewLine, updatedLines) + Environment.NewLine));
+        }
+        return updates;
+    }
+
+    private static (int Start, int Length, string Value)? GetSourceUriToken(string line)
+    {
+        var tokens = new List<(int Start, int Length)>();
+        for (var index = 0; index < line.Length;)
+        {
+            while (index < line.Length && char.IsWhiteSpace(line[index]))
+                index++;
+            if (index == line.Length)
+                break;
+            var start = index;
+            while (index < line.Length && !char.IsWhiteSpace(line[index]))
+                index++;
+            tokens.Add((start, index - start));
+        }
+        if (tokens.Count < 3 || line.Substring(tokens[0].Start, tokens[0].Length) != "deb")
+            return null;
+
+        var sourceToken = 1;
+        if (line[tokens[sourceToken].Start] == '[')
+        {
+            while (sourceToken < tokens.Count &&
+                   line[tokens[sourceToken].Start + tokens[sourceToken].Length - 1] != ']')
+                sourceToken++;
+            sourceToken++;
+        }
+        if (sourceToken >= tokens.Count)
+            return null;
+        var token = tokens[sourceToken];
+        return (token.Start, token.Length, line.Substring(token.Start, token.Length));
+    }
+
+    private static void SaveMirrorSourceUpdates(IReadOnlyList<MirrorSourceUpdate> updates)
+    {
+        var id = Guid.NewGuid().ToString("N");
+        var staged = new List<(MirrorSourceUpdate Update, string TemporaryPath, string BackupPath)>();
+        try
+        {
+            foreach (var update in updates)
+            {
+                if (new FileInfo(update.Path).LinkTarget is not null)
+                    throw new IOException($"Refusing to replace symbolic-link source file '{update.Path}'.");
+                var temporaryPath = update.Path + "." + id + ".tmp";
+                var backupPath = update.Path + ".change-all-mirrors-" + id + ".bak";
+                File.WriteAllText(temporaryPath, update.Content);
+                File.SetUnixFileMode(temporaryPath, File.GetUnixFileMode(update.Path));
+                File.Copy(update.Path, backupPath);
+                staged.Add((update, temporaryPath, backupPath));
+            }
+
+            var applied = new List<(MirrorSourceUpdate Update, string BackupPath)>();
+            try
+            {
+                foreach (var item in staged)
+                {
+                    File.Move(item.TemporaryPath, item.Update.Path, true);
+                    applied.Add((item.Update, item.BackupPath));
+                }
+            }
+            catch (Exception writeError)
+            {
+                var restoreErrors = new List<Exception>();
+                foreach (var item in applied.AsEnumerable().Reverse())
+                {
+                    try
+                    {
+                        File.Copy(item.BackupPath, item.Update.Path, true);
+                    }
+                    catch (Exception restoreError)
+                    {
+                        restoreErrors.Add(restoreError);
+                    }
+                }
+                if (restoreErrors.Count > 0)
+                {
+                    var errors = new List<Exception> { writeError };
+                    errors.AddRange(restoreErrors);
+                    throw new AggregateException(
+                        "Could not update all source files and one or more original files could not be restored.",
+                        errors);
+                }
+                throw new IOException("Could not update all Debian source files; original files were restored.", writeError);
+            }
+        }
+        finally
+        {
+            foreach (var item in staged)
+            {
+                if (File.Exists(item.TemporaryPath))
+                    File.Delete(item.TemporaryPath);
+            }
+        }
+    }
+
+    private static async Task<ValidatedSource> ValidateSourceAsync(
         RepositorySource source,
         string architecture,
-        IReadOnlyList<string> keyrings)
+        IReadOnlyList<string> keyrings,
+        CancellationToken cancellationToken = default)
     {
         var distUri = source.IsFlat
             ? EnsureTrailingSlash(source.Uri)
@@ -387,18 +766,20 @@ internal static class Program
         {
             var releasePath = Path.Combine(temp, "Release");
             var inReleasePath = Path.Combine(temp, "InRelease");
-            if (await TryDownloadToFileAsync(new Uri(distUri + "InRelease"), inReleasePath))
-                await VerifyInReleaseAsync(inReleasePath, releasePath, keyrings);
+            if (await TryDownloadToFileAsync(
+                    new Uri(distUri + "InRelease"), inReleasePath, cancellationToken))
+                await VerifyInReleaseAsync(inReleasePath, releasePath, keyrings, cancellationToken);
             else
             {
-                await DownloadToFileAsync(new Uri(distUri + "Release"), releasePath);
+                await DownloadToFileAsync(new Uri(distUri + "Release"), releasePath, cancellationToken);
                 var signaturePath = Path.Combine(temp, "Release.gpg");
-                await DownloadToFileAsync(new Uri(distUri + "Release.gpg"), signaturePath);
-                await VerifyReleaseAsync(signaturePath, releasePath, keyrings);
+                await DownloadToFileAsync(new Uri(distUri + "Release.gpg"), signaturePath, cancellationToken);
+                await VerifyReleaseAsync(signaturePath, releasePath, keyrings, cancellationToken);
             }
 
             var releaseText = await File.ReadAllTextAsync(releasePath);
             var checksums = ParseSha256(releaseText);
+            string? benchmarkIndexPath = null;
             if (!source.IsFlat)
             {
                 var releaseSuite = GetReleaseField(releaseText, "Suite");
@@ -430,21 +811,35 @@ internal static class Program
                 }
             }
 
-            foreach (var component in source.IsFlat ? new string?[] { null } : source.Components.Select(value => (string?)value))
+            if (source.IsFlat)
             {
-                var indexPaths = source.IsFlat
-                    ? new[] { "Packages.xz", "Packages.gz", "Packages" }
-                    : new[]
+                var indexPaths = new[] { "Packages.xz", "Packages.gz", "Packages" };
+                var indexPath = indexPaths.FirstOrDefault(checksums.ContainsKey);
+                if (indexPath is null)
+                    throw new InvalidDataException(
+                        $"signed Release metadata has no flat package index for {source.Uri}.");
+                benchmarkIndexPath = indexPath;
+            }
+            else
+            {
+                foreach (var component in source.Components)
+                {
+                    var indexPaths = new[]
                     {
                         $"{component}/binary-{architecture}/Packages.xz",
                         $"{component}/binary-{architecture}/Packages.gz",
                         $"{component}/binary-{architecture}/Packages"
                     };
-                if (!indexPaths.Any(checksums.ContainsKey))
-                    throw new InvalidDataException(source.IsFlat
-                        ? $"signed Release metadata has no flat package index for {source.Uri}."
-                        : $"signed Release metadata has no package index for {component}/{architecture}.");
+                    var indexPath = indexPaths.FirstOrDefault(checksums.ContainsKey);
+                    if (indexPath is null)
+                        throw new InvalidDataException(
+                            $"signed Release metadata has no package index for {component}/{architecture}.");
+                    benchmarkIndexPath ??= indexPath;
+                }
             }
+            if (benchmarkIndexPath is null)
+                throw new InvalidDataException($"No package index found for {source.Uri}.");
+            return new ValidatedSource(new Uri(distUri + benchmarkIndexPath));
         }
         finally
         {
@@ -616,7 +1011,11 @@ internal static class Program
         }
     }
 
-    private static async Task VerifyReleaseAsync(string signature, string release, IReadOnlyList<string> keyrings)
+    private static async Task VerifyReleaseAsync(
+        string signature,
+        string release,
+        IReadOnlyList<string> keyrings,
+        CancellationToken cancellationToken = default)
     {
         var arguments = new List<string> { "--status-fd", "1" };
         foreach (var keyring in keyrings)
@@ -626,7 +1025,7 @@ internal static class Program
         }
         arguments.Add(signature);
         arguments.Add(release);
-        var result = await RunProcessAsync("gpgv", arguments);
+        var result = await RunProcessAsync("gpgv", arguments, cancellationToken);
         if (result.ExitCode != 0 || !result.Output.Contains("[GNUPG:] VALIDSIG ", StringComparison.Ordinal))
             throw new InvalidDataException($"Repository Release signature verification failed: {result.Error.Trim()}");
     }
@@ -634,7 +1033,8 @@ internal static class Program
     private static async Task VerifyInReleaseAsync(
         string inRelease,
         string release,
-        IReadOnlyList<string> keyrings)
+        IReadOnlyList<string> keyrings,
+        CancellationToken cancellationToken = default)
     {
         var arguments = new List<string> { "--status-fd", "1", "--output", release };
         foreach (var keyring in keyrings)
@@ -643,7 +1043,7 @@ internal static class Program
             arguments.Add(keyring);
         }
         arguments.Add(inRelease);
-        var result = await RunProcessAsync("gpgv", arguments);
+        var result = await RunProcessAsync("gpgv", arguments, cancellationToken);
         if (result.ExitCode != 0 || !result.Output.Contains("[GNUPG:] VALIDSIG ", StringComparison.Ordinal))
             throw new InvalidDataException($"Repository InRelease signature verification failed: {result.Error.Trim()}");
     }
@@ -4068,7 +4468,10 @@ internal static class Program
         if (process.ExitCode != 0) throw new InvalidDataException($"{command} failed: {stderr}");
     }
 
-    private static async Task<ProcessResult> RunProcessAsync(string command, IReadOnlyList<string> arguments)
+    private static async Task<ProcessResult> RunProcessAsync(
+        string command,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken = default)
     {
         VerboseLog($"执行子进程: {command} {string.Join(' ', arguments.Select(FormatLogArgument))}");
         var start = new ProcessStartInfo(command) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
@@ -4076,7 +4479,26 @@ internal static class Program
         using var process = Process.Start(start) ?? throw new InvalidOperationException($"Could not start {command}.");
         var outputTask = process.StandardOutput.ReadToEndAsync();
         var errorTask = process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+        try
+        {
+            await process.WaitForExitAsync(cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited)
+            {
+                try
+                {
+                    process.Kill(true);
+                }
+                catch (InvalidOperationException) when (process.HasExited)
+                {
+                }
+            }
+            await process.WaitForExitAsync();
+            await Task.WhenAll(outputTask, errorTask);
+            throw;
+        }
         var output = await outputTask;
         var error = await errorTask;
         VerboseLog($"子进程结束: {command}，退出码 {process.ExitCode}");
@@ -4089,23 +4511,31 @@ internal static class Program
         "\"" + argument.Replace("\\", "\\\\", StringComparison.Ordinal)
             .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
 
-    private static async Task DownloadToFileAsync(Uri uri, string path)
+    private static async Task DownloadToFileAsync(
+        Uri uri,
+        string path,
+        CancellationToken cancellationToken = default)
     {
         VerboseLog($"HTTP 下载: {uri}");
-        using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+        using var response = await Http.GetAsync(
+            uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         VerboseLog($"HTTP 响应: {(int)response.StatusCode} {response.ReasonPhrase} ({uri})");
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
-        await using var input = await response.Content.ReadAsStreamAsync();
+        await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
-        await input.CopyToAsync(output);
+        await input.CopyToAsync(output, cancellationToken);
         VerboseLog($"HTTP 下载完成: {path} ({output.Length} 字节)");
     }
 
-    private static async Task<bool> TryDownloadToFileAsync(Uri uri, string path)
+    private static async Task<bool> TryDownloadToFileAsync(
+        Uri uri,
+        string path,
+        CancellationToken cancellationToken = default)
     {
         VerboseLog($"HTTP 尝试下载: {uri}");
-        using var response = await Http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
+        using var response = await Http.GetAsync(
+            uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
             VerboseLog($"HTTP 资源不存在: {uri}");
@@ -4114,9 +4544,9 @@ internal static class Program
         VerboseLog($"HTTP 响应: {(int)response.StatusCode} {response.ReasonPhrase} ({uri})");
         if (!response.IsSuccessStatusCode)
             throw new HttpRequestException($"Download failed for {uri}: HTTP {(int)response.StatusCode} {response.ReasonPhrase}.");
-        await using var input = await response.Content.ReadAsStreamAsync();
+        await using var input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true);
-        await input.CopyToAsync(output);
+        await input.CopyToAsync(output, cancellationToken);
         VerboseLog($"HTTP 下载完成: {path} ({output.Length} 字节)");
         return true;
     }
@@ -4349,6 +4779,11 @@ internal static class Program
         List<string> Components,
         string[]? Architectures,
         bool IsFlat);
+    private sealed record MirrorCandidate(string Name, string MainUri, string SecurityUri);
+    private sealed record MirrorTestResult(MirrorCandidate Mirror, double BytesPerSecond, string? Error);
+    private sealed record MirrorSourceUpdate(string Path, string Content);
+    private sealed record OperatingSystemDetails(string Id, string PrettyName, string[] IdLike);
+    private sealed record ValidatedSource(Uri PackageIndexUri);
     private sealed record IndexCacheMetadata(
         string SourceUri,
         string Suite,

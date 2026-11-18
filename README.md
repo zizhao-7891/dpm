@@ -41,8 +41,8 @@ kernel releases the lock automatically when the process exits.
 
 ## Sources
 
-`dpm` reads standard Debian `.list` files from `/etc/dpm/sources.list.d/` and
-does not select a mirror on your behalf. The optional Tsinghua example is
+`dpm` reads standard Debian `.list` files from `/etc/dpm/sources.list.d/`.
+The optional Tsinghua example is
 available at `/usr/share/doc/dpm/examples/tuna.list`; copy and edit it to
 configure that mirror, or create a file with your preferred mirror. Repository
 files use the same `deb URI suite component...` format as APT:
@@ -72,6 +72,20 @@ advertise components with an `updates/` prefix (for example
 `updates/main`); these correctly match the configured `main` component. Flat
 repositories are checked for a signed package index.
 
+`dpm change-all-mirrors` reads `/etc/os-release` to select a Debian or Ubuntu
+mirror catalog, then tests the built-in mirrors against the configured suites
+and components. Debian-derived distributions use the Debian catalog for
+`/debian` and `/debian-security` sources; Ubuntu-derived distributions use the
+Ubuntu catalog for `/ubuntu` sources. Other distro-specific repositories are
+left untouched. It rejects mirrors whose Release metadata is unavailable, has
+an invalid signature, or lacks the requested architecture/components. Valid
+mirrors are ranked by downloading up to 512 KiB of each signed Release's
+package index. The selected mirror is shown before confirmation; existing
+source files are backed up as
+`.change-all-mirrors-*.bak` before their mirror URLs are changed.
+Other repository entries are left untouched. Normal `dpm update` still verifies
+complete package-index hashes before using them.
+
 Indexes are stored in `/var/cache/dpm/list`; verified `.deb` files are stored
 in `/var/cache/dpm/deb`.
 
@@ -81,6 +95,7 @@ in `/var/cache/dpm/deb`.
 dpm update
 dpm up                    # alias for update
 dpm check-sources         # checks configured sources against signed Release metadata
+dpm change-all-mirrors   # tests OS-compatible mirrors and saves the fastest one
 dpm install PACKAGE|PATTERN [PACKAGE|PATTERN ...] # refreshes indexes, then installs all matches
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm fix                   # repairs missing dependencies and configures pending packages
