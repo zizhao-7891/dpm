@@ -96,6 +96,9 @@ dpm update
 dpm up                    # alias for update
 dpm check-sources         # checks configured sources against signed Release metadata
 dpm change-all-mirrors   # tests OS-compatible mirrors and saves the fastest one
+dpm source list          # lists configured repository entries
+dpm source add URI SUITE COMPONENT [COMPONENT ...] # adds a repository
+dpm source remove URI SUITE [COMPONENT ...] # removes matching repositories
 dpm install PACKAGE|PATTERN [PACKAGE|PATTERN ...] # refreshes indexes, then installs all matches
 dpm install ./FILE.deb    # installs a local package and resolves dependencies
 dpm fix                   # repairs missing dependencies and configures pending packages
@@ -120,6 +123,18 @@ dpm search TERM
 `--verbose` prints diagnostic details such as repository/index cache decisions,
 dependency plans, download and checksum activity, and subprocess output. It can
 appear before or after the command. `--all-log` is an alias for `--verbose`.
+
+Before installs, reinstalls, and upgrades, dpm resolves `Pre-Depends`, `Depends`,
+`Provides`, and `Recommends`, then audits `Conflicts` and `Breaks` across the
+full transaction and installed packages. Multiple valid dependency solutions
+are shown for interactive selection. Detected conflicts include suggested
+removal, hold, or repository alternatives instead of failing without guidance.
+
+For translations, dpm reads GNU MO catalogs from
+`/usr/share/locale/<lang>/LC_MESSAGES/dpm.mo` or
+`/usr/share/dpm/locale/<lang>/LC_MESSAGES/dpm.mo`. Source PO templates are kept
+under `po/`; `msgfmt` can compile `po/dpm.zh_CN.po` or another catalog into
+`dpm.mo`.
 
 Package-name patterns support `*` (any sequence) and `?` (one character) in
 `install`, `reinstall`, `remove`, `purge`, `upgrade`, `download`, and `search`.

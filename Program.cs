@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Formats.Tar;
 using System.Globalization;
 using System.IO.Compression;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -74,6 +75,7 @@ internal static class Program
 
     private static ConfirmationMode Confirmation = ConfirmationMode.Prompt;
     private static bool Verbose;
+    private static readonly Dictionary<string, string> Translations = LoadTranslations();
     private static List<PackageRecord>? PackageCache;
     private static HashSet<string>? SystemPackageFiles;
 
@@ -141,6 +143,9 @@ internal static class Program
                 case "change-all-mirrors":
                     RequireCount(args, 1);
                     await ChangeAllMirrorsAsync();
+                    break;
+                case "source":
+                    ManageSources(args);
                     break;
                 case "install":
                     if (args.Length < 2 && !fixBroken)
@@ -285,6 +290,9 @@ internal static class Program
               dpm up                    (alias for update)
               dpm check-sources         (check configured source suite, architecture, and indexes)
               dpm change-all-mirrors   (test OS-compatible mirrors and save the fastest one)
+              dpm source list           (list configured repository entries)
+              dpm source add URI SUITE COMPONENT [...] (add a repository source)
+              dpm source remove URI SUITE [COMPONENT ...] (remove matching repository entries)
               dpm install PACKAGE|PATTERN|FILE.deb [...] (updates indexes before installing)
               dpm fix                   (repair missing dependencies and configure pending packages)
               dpm -f | -fix             (alias for fix)
@@ -317,6 +325,9 @@ internal static class Program
         if (Verbose)
             Console.Error.WriteLine($"[verbose] {message}");
     }
+
+    private static string T(string message) =>
+        Translations.TryGetValue(message, out var translated) ? translated : message;
 
     private static void VerboseLogOutput(string label, string output)
     {
@@ -1116,6 +1127,7 @@ internal static class Program
         }
 
         var plan = ResolveDependenciesForOperation(roots, installed);
+        AuditPackageConflicts(plan, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!string.IsNullOrWhiteSpace(pendingConfiguration))
@@ -1269,6 +1281,8 @@ internal static class Program
         fields.TryGetValue("Depends", out var depends);
         fields.TryGetValue("Provides", out var provides);
         fields.TryGetValue("Recommends", out var recommends);
+        fields.TryGetValue("Conflicts", out var conflicts);
+        fields.TryGetValue("Breaks", out var breaks);
         fields.TryGetValue("Section", out var section);
         fields.TryGetValue("Tag", out var tags);
         var isMetaPackage = string.Equals(section, "metapackages", StringComparison.OrdinalIgnoreCase) ||
@@ -1278,7 +1292,7 @@ internal static class Program
 
         return new PackageRecord(name, version, Path.GetFileName(path), "", description ?? "",
             "", preDepends ?? "", depends ?? "", provides ?? "", recommends ?? "",
-            isMetaPackage, new FileInfo(path).Length, path);
+            conflicts ?? "", breaks ?? "", isMetaPackage, new FileInfo(path).Length, path);
     }
 
     private static async Task ReinstallAsync(string packageName)
@@ -1305,6 +1319,7 @@ internal static class Program
         }
 
         var plan = ResolveDependenciesForOperation(roots, installed);
+        AuditPackageConflicts(plan, installed);
         var orderedPlan = OrderPackagesForInstall(plan, installed);
         var changes = CreatePackageChanges(plan, installed);
         if (!ConfirmPackageChanges("重新安装", changes))
@@ -1524,6 +1539,7 @@ internal static class Program
         try
         {
             plan = ResolveDependencies(upgradeCandidates, installed);
+            AuditPackageConflicts(plan, installed);
         }
         catch (InvalidOperationException)
         {
@@ -1537,6 +1553,7 @@ internal static class Program
             }
 
             plan = ResolveDependenciesForOperation(compatibleCandidates, installed);
+            AuditPackageConflicts(plan, installed);
             PrintHeldBackUpgrades(heldBack);
 
             void AddCompatibleUpgradeBatch(PackageRecord[] batch)
@@ -1730,7 +1747,7 @@ internal static class Program
             {
                 var package = new PackageRecord(
                     "dpm", targetVersion, Path.GetFileName(temporaryPackage), "", "",
-                    "", "", "", "", "", false, new FileInfo(temporaryPackage).Length);
+                    "", "", "", "", "", "", "", false, new FileInfo(temporaryPackage).Length);
                 await InstallDpmPackageAsync(temporaryPackage, package);
                 await ProcessDpmTriggersAsync();
             }
@@ -4044,6 +4061,8 @@ internal static class Program
                 fields.TryGetValue("Depends", out var depends);
                 fields.TryGetValue("Provides", out var provides);
                 fields.TryGetValue("Recommends", out var recommends);
+                fields.TryGetValue("Conflicts", out var conflicts);
+                fields.TryGetValue("Breaks", out var breaks);
                 fields.TryGetValue("Section", out var section);
                 fields.TryGetValue("Tag", out var tags);
                 var isMetaPackage = string.Equals(section, "metapackages", StringComparison.OrdinalIgnoreCase) ||
@@ -4052,7 +4071,7 @@ internal static class Program
                                     .Contains("role::metapackage", StringComparer.OrdinalIgnoreCase);
                 result.Add(new PackageRecord(name, version, filename, hash ?? "", description ?? "",
                     sourceUri, preDepends ?? "", depends ?? "", provides ?? "", recommends ?? "",
-                    isMetaPackage, size));
+                    conflicts ?? "", breaks ?? "", isMetaPackage, size));
             }
         }
         return PackageCache = result;
@@ -4558,6 +4577,241 @@ internal static class Program
         return CryptographicOperations.FixedTimeEquals(Encoding.ASCII.GetBytes(actual), Encoding.ASCII.GetBytes(expected.ToLowerInvariant()));
     }
 
+    private static Dictionary<string, string> LoadTranslations()
+    {
+        var locale = Environment.GetEnvironmentVariable("LANG")
+                      ?? Environment.GetEnvironmentVariable("LC_ALL")
+                      ?? "C";
+        var language = locale.Split(['_', '.', '-'], StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault();
+        if (string.Equals(language, "zh", StringComparison.OrdinalIgnoreCase))
+            language = "zh_CN";
+        if (string.IsNullOrWhiteSpace(language) ||
+            string.Equals(language, "C", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(language, "POSIX", StringComparison.OrdinalIgnoreCase))
+            return new Dictionary<string, string>(StringComparer.Ordinal);
+
+        var candidates = new[]
+        {
+            $"/usr/share/locale/{locale.Replace('.', '_').Split('_')[0]}/LC_MESSAGES/dpm.mo",
+            $"/usr/share/locale/{language}/LC_MESSAGES/dpm.mo",
+            $"/usr/share/dpm/locale/{language}/LC_MESSAGES/dpm.mo"
+        };
+        foreach (var path in candidates.Distinct(StringComparer.Ordinal))
+        {
+            if (!File.Exists(path))
+                continue;
+            try
+            {
+                return ParseMoTranslations(path);
+            }
+            catch
+            {
+                // An invalid catalog must not prevent package operations.
+            }
+        }
+        return new Dictionary<string, string>(StringComparer.Ordinal);
+    }
+
+    private static Dictionary<string, string> ParseMoTranslations(string path)
+    {
+        var result = new Dictionary<string, string>(StringComparer.Ordinal);
+        using var stream = File.OpenRead(path);
+        using var reader = new BinaryReader(stream, Encoding.ASCII);
+        var magic = reader.ReadUInt32();
+        if (magic != 0x950412de && magic != 0xde120495)
+            throw new InvalidDataException("Invalid GNU MO catalog.");
+        var littleEndian = magic == 0x950412de;
+        Func<byte[], uint> readUInt32 = bytes =>
+            littleEndian ? BitConverter.ToUInt32(bytes, 0) : BinaryPrimitives.ReadUInt32BigEndian(bytes);
+        reader.ReadUInt32();
+        var originalCount = readUInt32(reader.ReadBytes(4));
+        var translatedCount = readUInt32(reader.ReadBytes(4));
+        var originalTableOffset = readUInt32(reader.ReadBytes(4));
+        var translatedTableOffset = readUInt32(reader.ReadBytes(4));
+        stream.Seek(originalTableOffset, SeekOrigin.Begin);
+        var originalEntries = new (uint Length, uint Offset)[originalCount];
+        for (var i = 0; i < originalCount; i++)
+            originalEntries[i] = (readUInt32(reader.ReadBytes(4)), readUInt32(reader.ReadBytes(4)));
+        stream.Seek(translatedTableOffset, SeekOrigin.Begin);
+        var translatedEntries = new (uint Length, uint Offset)[translatedCount];
+        for (var i = 0; i < translatedCount; i++)
+            translatedEntries[i] = (readUInt32(reader.ReadBytes(4)), readUInt32(reader.ReadBytes(4)));
+        for (var i = 0; i < originalCount; i++)
+        {
+            stream.Seek(originalEntries[i].Offset, SeekOrigin.Begin);
+            var original = Encoding.UTF8.GetString(reader.ReadBytes((int)originalEntries[i].Length));
+            stream.Seek(translatedEntries[i].Offset, SeekOrigin.Begin);
+            var translated = Encoding.UTF8.GetString(reader.ReadBytes((int)translatedEntries[i].Length));
+            if (original.Length > 0 && translated.Length > 0)
+                result[original] = translated;
+        }
+        return result;
+    }
+
+    private static void AuditPackageConflicts(
+        IReadOnlyDictionary<string, PackageRecord> plan,
+        IReadOnlyDictionary<string, InstalledPackage> installed)
+    {
+        var conflicts = new List<string>();
+        foreach (var package in plan.Values)
+        {
+            foreach (var expression in new[] { package.Conflicts, package.Breaks })
+            {
+                foreach (var group in ParseDependencyGroups(expression))
+                {
+                    foreach (var alternative in group)
+                    {
+                        var counterpart = plan.Values.FirstOrDefault(candidate =>
+                            candidate.Name != package.Name &&
+                            PackageSatisfies(candidate, alternative));
+                        if (counterpart is not null)
+                        {
+                            conflicts.Add($"{package.Name} {package.Version} conflicts with " +
+                                          $"{counterpart.Name} {counterpart.Version}: {FormatDependency(alternative)}");
+                            continue;
+                        }
+
+                        var installedCounterpart = installed.FirstOrDefault(entry =>
+                            PackageNameMatches(entry.Key, alternative.Name) &&
+                            !plan.ContainsKey(GetPackageBaseName(entry.Key)) &&
+                            VersionSatisfies(entry.Value.Version, alternative));
+                        if (installedCounterpart.Key is not null)
+                            conflicts.Add($"{package.Name} {package.Version} conflicts with installed " +
+                                          $"{installedCounterpart.Key} {installedCounterpart.Value.Version}: " +
+                                          FormatDependency(alternative));
+                    }
+                }
+            }
+        }
+        if (conflicts.Count == 0)
+            return;
+
+        var unique = conflicts.Distinct(StringComparer.Ordinal).ToList();
+        Console.Error.WriteLine("Dependency conflict(s) detected:");
+        foreach (var conflict in unique)
+            Console.Error.WriteLine($"  - {conflict}");
+        Console.Error.WriteLine("Suggested solutions:");
+        Console.Error.WriteLine("  1. Remove or replace one of the conflicting packages.");
+        Console.Error.WriteLine("  2. Use dpm hold on the installed package and choose a compatible version.");
+        Console.Error.WriteLine("  3. Enable a repository that provides compatible package versions, then run dpm update.");
+        throw new InvalidOperationException("The package transaction would create dependency conflicts.");
+    }
+
+    private static void ManageSources(string[] args)
+    {
+        if (args.Length < 2)
+            throw new ArgumentException("Usage: dpm source list|add|remove");
+
+        switch (args[1])
+        {
+            case "list":
+                RequireCount(args, 2);
+                if (!Directory.Exists(SourceDirectory))
+                {
+                    Console.WriteLine("No repository sources configured.");
+                    return;
+                }
+                var entries = Directory.EnumerateFiles(SourceDirectory, "*.list")
+                    .SelectMany(File.ReadLines)
+                    .Select(line => line.Trim())
+                    .Where(line => line.Length > 0 && !line.StartsWith('#'))
+                    .ToList();
+                if (entries.Count == 0)
+                    Console.WriteLine("No repository sources configured.");
+                else
+                    foreach (var entry in entries)
+                        Console.WriteLine(entry);
+                return;
+
+            case "add":
+                if (args.Length < 5)
+                    throw new ArgumentException("Usage: dpm source add URI SUITE COMPONENT [COMPONENT ...]");
+                if (!Uri.TryCreate(args[2], UriKind.Absolute, out var uri) ||
+                    uri.Scheme is not ("http" or "https"))
+                    throw new InvalidDataException($"Invalid repository URI: {args[2]}");
+                var suite = args[3];
+                var components = args.Skip(4).ToArray();
+                if (suite.Length == 0 || components.Any(component => component.Length == 0))
+                    throw new InvalidDataException("Repository suite and components cannot be empty.");
+                Directory.CreateDirectory(SourceDirectory);
+                var sourcePath = Path.Combine(SourceDirectory, "dpm-managed.list");
+                var sourceLine = $"deb {uri} {suite} {string.Join(" ", components)}";
+                var existing = File.Exists(sourcePath)
+                    ? File.ReadAllLines(sourcePath).ToList()
+                    : new List<string>();
+                if (existing.Contains(sourceLine, StringComparer.Ordinal))
+                {
+                    Console.WriteLine($"Repository source is already configured: {sourceLine}");
+                    return;
+                }
+                existing.Add(sourceLine);
+                WriteTextAtomically(sourcePath, string.Join(Environment.NewLine, existing) + Environment.NewLine);
+                Console.WriteLine($"Added repository source: {sourceLine}");
+                return;
+
+            case "remove":
+                if (args.Length < 4)
+                    throw new ArgumentException("Usage: dpm source remove URI SUITE [COMPONENT ...]");
+                if (!Uri.TryCreate(args[2], UriKind.Absolute, out var removeUri) ||
+                    removeUri.Scheme is not ("http" or "https"))
+                    throw new InvalidDataException($"Invalid repository URI: {args[2]}");
+                if (!Directory.Exists(SourceDirectory))
+                {
+                    Console.WriteLine("No repository sources configured.");
+                    return;
+                }
+                var removed = false;
+                foreach (var path in Directory.EnumerateFiles(SourceDirectory, "*.list"))
+                {
+                    var lines = File.ReadAllLines(path).ToList();
+                    var filtered = lines.Where(line =>
+                    {
+                        var fields = line.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                        var match = fields.Length >= 4 &&
+                                    fields[0] == "deb" &&
+                                    Uri.TryCreate(fields[1], UriKind.Absolute, out var lineUri) &&
+                                    UriCompare(lineUri, removeUri) &&
+                                    fields[2] == args[3] &&
+                                    (args.Length == 4 ||
+                                     fields.Skip(3).SequenceEqual(args.Skip(4), StringComparer.Ordinal));
+                        removed |= match;
+                        return !match;
+                    }).ToList();
+                    if (filtered.Count != lines.Count)
+                        WriteTextAtomically(path, string.Join(Environment.NewLine, filtered) +
+                                                  (filtered.Count > 0 ? Environment.NewLine : ""));
+                }
+                Console.WriteLine(removed
+                    ? "Removed matching repository source(s)."
+                    : "No matching repository source was found.");
+                return;
+
+            default:
+                throw new ArgumentException("Usage: dpm source list|add|remove");
+        }
+    }
+
+    private static bool UriCompare(Uri left, Uri right) =>
+        string.Equals(left.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.Unescaped),
+            right.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.Unescaped),
+            StringComparison.OrdinalIgnoreCase);
+
+    private static void WriteTextAtomically(string path, string content)
+    {
+        var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(temporary, content);
+            File.Move(temporary, path, true);
+        }
+        finally
+        {
+            if (File.Exists(temporary))
+                File.Delete(temporary);
+        }
+    }
+
     private static List<RepositorySource> ReadSources()
     {
         var result = new List<RepositorySource>();
@@ -4802,6 +5056,8 @@ internal static class Program
         string Depends,
         string Provides,
         string Recommends,
+        string Conflicts,
+        string Breaks,
         bool IsMetaPackage,
         long? Size,
         string? LocalPath = null);

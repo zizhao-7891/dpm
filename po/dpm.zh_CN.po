@@ -1,0 +1,26 @@
+# Chinese (Simplified) translation for dpm
+msgid ""
+msgstr ""
+"Project-Id-Version: dpm 0.1.55\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Error: dpm must be run as root. It will not attempt privilege escalation."
+msgstr "错误：dpm 必须以 root 身份运行，不会尝试提升权限。"
+
+msgid "No repository sources configured."
+msgstr "尚未配置任何软件源。"
+
+msgid "Added repository source:"
+msgstr "已添加软件源："
+
+msgid "Removed matching repository source(s)."
+msgstr "已移除匹配的软件源。"
+
+msgid "Dependency conflict(s) detected:"
+msgstr "检测到依赖冲突："
+
+msgid "Suggested solutions:"
+msgstr "建议解决方案："
