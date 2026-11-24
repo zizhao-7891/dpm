@@ -2,7 +2,7 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-VERSION=${VERSION:-0.1.55}
+VERSION=${VERSION:-0.1.56}
 ARCH=${ARCH:-arm64}
 OUTPUT="$ROOT/dist"
 STAGE="$ROOT/.package-root"
@@ -46,6 +46,7 @@ install -m 0644 "$ROOT/tuna.list" "$STAGE/usr/share/doc/dpm/examples/tuna.list"
 mkdir -p "$STAGE/usr/share/dpm/locale/zh_CN/LC_MESSAGES" "$STAGE/usr/share/dpm/locale/en/LC_MESSAGES"
 python3 - "$ROOT/po/dpm.zh_CN.po" "$STAGE/usr/share/dpm/locale/zh_CN/LC_MESSAGES/dpm.mo" \
     "$ROOT/po/dpm.en.po" "$STAGE/usr/share/dpm/locale/en/LC_MESSAGES/dpm.mo" <<'PY'
+import ast
 import struct
 import sys
 
@@ -64,14 +65,14 @@ def parse(path):
             continue
         if line.startswith("msgid "):
             finish()
-            msgid = line[len("msgid "):].strip()[1:-1]
+            msgid = ast.literal_eval(line[len("msgid "):].strip())
             msgstr = None
             section = "id"
         elif line.startswith("msgstr "):
-            msgstr = line[len("msgstr "):].strip()[1:-1]
+            msgstr = ast.literal_eval(line[len("msgstr "):].strip())
             section = "str"
         elif line.startswith('"') and section:
-            value = line.strip()[1:-1]
+            value = ast.literal_eval(line.strip())
             if section == "id":
                 msgid += value
             else:

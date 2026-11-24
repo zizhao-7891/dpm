@@ -108,7 +108,7 @@ internal static class Program
 
         if (GetEffectiveUid() != 0)
         {
-            Console.Error.WriteLine("Error: dpm must be run as root. It will not attempt privilege escalation.");
+            Console.Error.WriteLine(T("Error: dpm must be run as root. It will not attempt privilege escalation."));
             return 1;
         }
 
@@ -4688,14 +4688,14 @@ internal static class Program
             return;
 
         var unique = conflicts.Distinct(StringComparer.Ordinal).ToList();
-        Console.Error.WriteLine("Dependency conflict(s) detected:");
+        Console.Error.WriteLine(T("Dependency conflict(s) detected:"));
         foreach (var conflict in unique)
             Console.Error.WriteLine($"  - {conflict}");
-        Console.Error.WriteLine("Suggested solutions:");
+        Console.Error.WriteLine(T("Suggested solutions:"));
         Console.Error.WriteLine("  1. Remove or replace one of the conflicting packages.");
         Console.Error.WriteLine("  2. Use dpm hold on the installed package and choose a compatible version.");
         Console.Error.WriteLine("  3. Enable a repository that provides compatible package versions, then run dpm update.");
-        throw new InvalidOperationException("The package transaction would create dependency conflicts.");
+        throw new InvalidOperationException(T("The package transaction would create dependency conflicts."));
     }
 
     private static void ManageSources(string[] args)
@@ -4709,7 +4709,7 @@ internal static class Program
                 RequireCount(args, 2);
                 if (!Directory.Exists(SourceDirectory))
                 {
-                    Console.WriteLine("No repository sources configured.");
+                    Console.WriteLine(T("No repository sources configured."));
                     return;
                 }
                 var entries = Directory.EnumerateFiles(SourceDirectory, "*.list")
@@ -4718,7 +4718,7 @@ internal static class Program
                     .Where(line => line.Length > 0 && !line.StartsWith('#'))
                     .ToList();
                 if (entries.Count == 0)
-                    Console.WriteLine("No repository sources configured.");
+                    Console.WriteLine(T("No repository sources configured."));
                 else
                     foreach (var entry in entries)
                         Console.WriteLine(entry);
@@ -4747,7 +4747,7 @@ internal static class Program
                 }
                 existing.Add(sourceLine);
                 WriteTextAtomically(sourcePath, string.Join(Environment.NewLine, existing) + Environment.NewLine);
-                Console.WriteLine($"Added repository source: {sourceLine}");
+                Console.WriteLine($"{T("Added repository source:")} {sourceLine}");
                 return;
 
             case "remove":
@@ -4783,8 +4783,8 @@ internal static class Program
                                                   (filtered.Count > 0 ? Environment.NewLine : ""));
                 }
                 Console.WriteLine(removed
-                    ? "Removed matching repository source(s)."
-                    : "No matching repository source was found.");
+                    ? T("Removed matching repository source(s).")
+                    : T("No matching repository source was found."));
                 return;
 
             default:
